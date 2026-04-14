@@ -1,0 +1,14 @@
+{
+  "name": "zalo-group-scanner",
+  "version": "1.0.0",
+  "description": "Quét danh sách thành viên nhóm Zalo từ link nhóm",
+  "main": "scanner.mjs",
+  "type": "module",
+  "scripts": {
+    "scan": "node scanner.mjs",
+    "start": "node scanner.mjs"
+  },
+  "dependencies": {
+    "zca-js": "^2.1.2"
+  }
+}

@@ -1,0 +1,7 @@
+node_modules/
+nodejs_portable/
+output/
+credentials.json
+session.json
+node.zip
+*.log
