@@ -6,23 +6,43 @@
 ╚══════════════════════════════════════════════════════════╝
 """
 
-import sys, os, json, subprocess, threading, csv, time, re
+import sys, os, json, subprocess, threading, csv, time, re, random, shutil
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from datetime import datetime
 from pathlib import Path
 
 try:
-    from openpyxl import Workbook
+    from openpyxl import Workbook, load_workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.drawing.image import Image as XLImage
     HAS_OPENPYXL = True
 except ImportError:
     HAS_OPENPYXL = False
 
+try:
+    import requests
+    from io import BytesIO
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
+
+try:
+    from PIL import Image as PILImage
+    HAS_PILLOW = True
+except ImportError:
+    HAS_PILLOW = False
+
 BASE_DIR = Path(__file__).parent
 CREDENTIALS_FILE = BASE_DIR / "credentials.json"
-SCAN_DATA_DIR = BASE_DIR / "scan_data"
+EXCEL_DATA_DIR = BASE_DIR / "excel_data"
+EXCEL_DATA_DIR.mkdir(exist_ok=True)
+AVATAR_CACHE_DIR = BASE_DIR / "avatar_cache"
+AVATAR_CACHE_DIR.mkdir(exist_ok=True)
 LAST_SESSION_FILE = BASE_DIR / "last_session.json"
+TEMPLATES_FILE = BASE_DIR / "templates.json"
+IMAGE_DIR = BASE_DIR / "anh_ket_ban_nhan_tin"
+IMAGE_DIR.mkdir(exist_ok=True)
 
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -89,11 +109,20 @@ class ZaloBridge:
                 if not line: continue
                 msg = json.loads(line)
                 mid, data, err = msg.get("id"), msg.get("data"), msg.get("error")
-                events = ("scan_progress", "scan_error", "batch_progress", "ready")
-                if mid in events:
-                    if self.on_event: self.on_event(mid, data)
-                elif mid in self.pending:
-                    self.pending.pop(mid)(data, err)
+                
+                # If mid is a known callback, call it but don't pop if it's progress
+                if mid in self.pending:
+                    # Logic: if data has 'current', 'page', 'action', etc., it's progress, don't pop
+                    is_progress = isinstance(data, dict) and ("current" in data or "fetched" in data or "event" in data or "action" in data)
+                    if is_progress:
+                        self.pending[mid](data, err)
+                    else:
+                        self.pending.pop(mid)(data, err)
+                elif mid == "ready":
+                    if self.on_event: self.on_event("ready", data)
+                elif self.on_event:
+                    # Global events or status
+                    self.on_event(mid, data)
             except json.JSONDecodeError: continue
             except: break
 
@@ -133,12 +162,13 @@ class GradientCanvas(tk.Canvas):
 
 class Btn(tk.Frame):
     def __init__(self, master, text, cmd=None, color=C["accent"], fg="white", **kw):
+        fnt = kw.pop("font", F["btn"])
         bg = master.cget("bg") if hasattr(master,'cget') else C["bg"]
         super().__init__(master, bg=bg, **kw)
         self.color, self.cmd = color, cmd
         r,g,b = int(color[1:3],16), int(color[3:5],16), int(color[5:7],16)
         self.hover = f"#{min(255,r+30):02x}{min(255,g+30):02x}{min(255,b+30):02x}"
-        self.lbl = tk.Label(self, text=text, font=F["btn"], bg=color, fg=fg,
+        self.lbl = tk.Label(self, text=text, font=fnt, bg=color, fg=fg,
                             padx=16, pady=6, cursor="hand2")
         self.lbl.pack(fill="x")
         self.lbl.bind("<Enter>", lambda e: self.lbl.config(bg=self.hover))
@@ -157,7 +187,7 @@ class Btn(tk.Frame):
 def make_entry(parent, **kw):
     return tk.Entry(parent, font=F["mono"], bg=C["input"], fg=C["text"],
                     insertbackground=C["text"], highlightbackground=C["border"],
-                    highlightthickness=1, relief="flat", bd=5, **kw)
+                    highlightthickness=1, relief="flat", bd=2, **kw)
 
 
 def make_label(parent, text, **kw):
@@ -178,8 +208,8 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("Zalo Group Scanner v2.1")
-        root.geometry("1200x820")
-        root.minsize(1050, 720)
+        root.geometry("1200x950")
+        root.minsize(1050, 850)
         root.configure(bg=C["bg"])
 
         self.bridge = None
@@ -190,10 +220,13 @@ class App:
         self.accounts = self._load_accounts()
         self.current_account = None
         self.batch_running = False
-        self.image_path = tk.StringVar()
+        self.image_path = tk.StringVar(value="Chưa chọn ảnh...")
+        self.use_random = tk.BooleanVar(value=True)
         self.scan_history = self._load_scan_history()
+        self.templates = self._load_templates()
+        self.current_data_file = None # Theo dõi file JSON hiện tại để lưu đè status
 
-        SCAN_DATA_DIR.mkdir(exist_ok=True)
+        EXCEL_DATA_DIR.mkdir(exist_ok=True)
         self.node_path = self._find_node()
         self._build_ui()
         self._start_bridge()
@@ -213,10 +246,16 @@ class App:
         try:
             if CREDENTIALS_FILE.exists():
                 d = json.loads(CREDENTIALS_FILE.read_text("utf-8"))
-                if isinstance(d, list): return d
-                if isinstance(d, dict):
-                    if "accounts" in d: return d["accounts"]
-                    return [d]  # migrate old single-account format
+                accs = []
+                if isinstance(d, list): accs = d
+                elif isinstance(d, dict):
+                    if "accounts" in d: accs = d["accounts"]
+                    else: accs = [d] # Single account format
+                
+                # Ensure all accounts have a 'name'
+                for i, a in enumerate(accs):
+                    if "name" not in a: a["name"] = f"Acc {i+1}"
+                return accs
         except: pass
         return []
 
@@ -226,40 +265,111 @@ class App:
 
     # ---- Scan Data Persistence ----
     def _load_scan_history(self):
-        """Load danh sách scan đã lưu"""
+        """Load danh sách file Excel đã lưu"""
         history = []
-        if SCAN_DATA_DIR.exists():
-            for f in sorted(SCAN_DATA_DIR.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True):
-                try:
-                    d = json.loads(f.read_text("utf-8"))
-                    history.append({"file": f, "name": d.get("group",{}).get("name","?"),
-                                    "count": d.get("memberCount",0),
-                                    "time": d.get("scanTime","?")})
-                except: pass
+        if EXCEL_DATA_DIR.exists():
+            for f in sorted(EXCEL_DATA_DIR.glob("*.xlsx"), key=lambda x: x.stat().st_mtime, reverse=True):
+                history.append({"file": f, "name": f.name})
         return history
 
-    def _save_scan_data(self, scan_result):
-        """Tự động lưu kết quả quét vào scan_data/"""
-        g = scan_result.get("groupInfo", {})
-        mems = scan_result.get("members", [])
-        name = re.sub(r'[<>:"/\\|?*]', '_', g.get("name","group"))[:60]
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        fp = SCAN_DATA_DIR / f"{name}_{ts}.json"
+    def _save_scan_data(self, scan_result=None, auto=False):
+        """Lưu kết quả quét trực tiếp vào Excel có kèm Avatar (Hỗ trợ Auto-update)"""
+        if not HAS_OPENPYXL: return None
+        
+        # Nếu không truyền scan_result, lấy từ bộ nhớ hiện tại
+        res = scan_result or self.scan_result
+        if not res: return None
+        
+        g = res.get("groupInfo", {})
+        mems = res.get("members", [])
+        
+        # Luôn dùng duy nhất 1 file cho mỗi nhóm (Tên nhóm + ID nhóm)
+        g_name = self._safe_name(g.get("name","group"))
+        g_id = self._safe_name(g.get("groupId","unknown"))
+        fp = EXCEL_DATA_DIR / f"{g_name}_{g_id}.xlsx"
+        
+        # Nếu đang ở chế độ auto-update và file đang mở hợp lệ, giữ nguyên đường dẫn đó
+        if auto and self.current_data_file and self.current_data_file.exists():
+            fp = self.current_data_file
+        
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Thành viên"
+        
+        # Style
+        hdr_font = Font(bold=True, color="FFFFFF")
+        hdr_fill = PatternFill(start_color="1F6FEB", end_color="1F6FEB", fill_type="solid")
+        center_align = Alignment(horizontal="center", vertical="center")
+        thin = Side(style="thin", color="CCCCCC")
+        border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-        data = {
-            "group": {
-                "id": g.get("groupId"), "name": g.get("name"), "desc": g.get("desc"),
-                "totalMember": g.get("totalMember"), "creatorId": g.get("creatorId"),
-                "adminIds": g.get("adminIds", []),
-            },
-            "scanTime": datetime.now().isoformat(),
-            "memberCount": len(mems),
-            "members": mems,
-        }
-        fp.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
-        self.scan_history.insert(0, {"file": fp, "name": g.get("name","?"),
-                                     "count": len(mems), "time": data["scanTime"]})
+        # Meta Data
+        ws.append([f"Nhóm: {g.get('name')}", f"ID: {g.get('groupId')}", f"Tổng: {g.get('totalMember')}"])
+        ws.append(["Quét lúc:", datetime.now().isoformat()])
+        ws.append([])
+
+        # Table Header: STT, Avatar, ID, Tên hiển thị, Tên Zalo, Vai trò, Kết bạn, Mời nhóm, Nhắn tin
+        headers = ["STT", "Avatar", "Zalo ID", "Tên hiển thị", "Tên Zalo", "Vai trò", "Kết bạn", "Mời nhóm", "Nhắn tin"]
+        ws.append(headers)
+        for cell in ws[4]:
+            cell.font, cell.fill, cell.alignment, cell.border = hdr_font, hdr_fill, center_align, border
+
+        # Data rows
+        for i, m in enumerate(mems):
+            rid = i + 5
+            ws.row_dimensions[rid].height = 45 
+            
+            f_stat = "v" if m.get("friend_sent") else ""
+            i_stat = "v" if m.get("invite_sent") else ""
+            m_stat = "v" if m.get("message_sent") else ""
+            
+            row_vals = [i+1, "", str(m.get("id")), m.get("dName"), m.get("zaloName"), m.get("role") or "Thành viên", f_stat, i_stat, m_stat]
+            ws.append(row_vals)
+            
+            # Download Avatar (Chỉ làm khi tạo file mới hoặc file chưa có ảnh để tránh lag)
+            if not auto:
+                avt_url = m.get("avatar")
+                if HAS_PILLOW and HAS_REQUESTS and avt_url:
+                    try:
+                        resp = requests.get(avt_url, timeout=3)
+                        if resp.status_code == 200:
+                            img_data = BytesIO(resp.content)
+                            img = PILImage.open(img_data)
+                            img.thumbnail((55, 55))
+                            temp_p = AVATAR_CACHE_DIR / f"{m.get('id')}.png"
+                            img.save(temp_p)
+                            xl_img = XLImage(temp_p)
+                            ws.add_image(xl_img, f"B{rid}")
+                    except: pass
+            
+            for col in range(1, 10): # Update border for all 9 columns
+                cell = ws.cell(row=rid, column=col)
+                cell.border = border
+                cell.alignment = Alignment(vertical="center", horizontal="center" if col in [1,2,7,8,9] else "left")
+
+        # Column widths
+        ws.column_dimensions["A"].width = 6
+        ws.column_dimensions["B"].width = 10
+        ws.column_dimensions["C"].width = 22
+        ws.column_dimensions["D"].width = 28
+        ws.column_dimensions["E"].width = 24
+        
+        try:
+            wb.save(fp)
+            self.current_data_file = fp
+            # Update history memory
+            if not any(h["file"] == fp for h in self.scan_history):
+                self.scan_history = self._load_scan_history()
+                self._refresh_history_combo()
+        except Exception as e:
+            print(f"Error saving excel: {e}")
+            
         return fp
+
+    def _refresh_history_combo(self):
+        names = [h['name'] for h in self.scan_history]
+        self.history_combo["values"] = names
+        if names: self.history_combo.current(0)
 
     def _save_last_session(self):
         """Lưu toàn bộ thông số và data phiên làm việc"""
@@ -268,11 +378,17 @@ class App:
                 "link": self.link_entry.get().strip(),
                 "delay": self.delay_entry.get().strip(),
                 "limit": self.limit_entry.get().strip(),
-                "friend_msg": self.friend_msg.get().strip(),
                 "target_group_id": self.group_id_entry.get().strip(),
+                "use_random": self.use_random.get(),
                 "scan_result": self.scan_result
             }
             LAST_SESSION_FILE.write_text(json.dumps(data, ensure_ascii=False), "utf-8")
+            
+            # Đồng bộ luôn vào file Excel hiện tại nếu có
+            if self.current_data_file and self.current_data_file.exists() and self.scan_result:
+                # Với Excel, ta sẽ ghi đè toàn bộ hoặc cập nhật status. 
+                # Để đảm bảo đồng bộ, ta gọi lại hàm save Excel
+                self._save_scan_data(self.scan_result)
         except: pass
 
     def _load_last_session(self):
@@ -289,30 +405,46 @@ class App:
                     self.delay_entry.delete(0, "end")
                     self.delay_entry.insert(0, d["delay"])
                 if d.get("limit"):
-                    self.limit_entry.get()
                     self.limit_entry.delete(0, "end")
                     self.limit_entry.insert(0, d["limit"])
-                if d.get("friend_msg"):
-                    self.friend_msg.delete(0, "end")
-                    self.friend_msg.insert(0, d["friend_msg"])
+
                 if d.get("target_group_id"):
                     self.group_id_entry.delete(0, "end")
                     self.group_id_entry.insert(0, d["target_group_id"])
+                if "use_random" in d:
+                    self.use_random.set(d["use_random"])
 
-                self.scan_result = d.get("scan_result")
-                if self.scan_result:
-                    self._log("🔄 Đã khôi phục toàn bộ cài đặt & data phiên trước.", "info")
+                # Restore scan result and member list
+                sr = d.get("scan_result")
+                if sr and sr.get("members"):
+                    self.scan_result = sr
                     self._apply_filter()
-        except: pass
+                    n = len(sr.get("members", []))
+                    gname = sr.get("groupInfo", {}).get("name", "N/A")
+                    self.plabel.config(text=f"✅ Đã tải: {n} mms từ {gname}")
+                    self.pvar.set(100)
+                    self._log(f"🔄 Đã khôi phục phiên trước: {n} mms — {gname}", "info")
+                else:
+                    self._log("🔄 Đã khôi phục cài đặt phiên trước.", "info")
+        except Exception as e:
+            self._log(f"⚠️ Lỗi khôi phục phiên: {e}", "warn")
 
     # ---- UI ----
     def _build_ui(self):
-        main = tk.Frame(self.root, bg=C["bg"])
-        main.pack(fill="both", expand=True, padx=8, pady=8)
+        # Create Notebook for Tabs
+        self.nb = ttk.Notebook(self.root)
+        self.nb.pack(fill="both", expand=True, padx=5, pady=5)
 
-        # LEFT
-        left = tk.Frame(main, bg=C["bg"], width=330)
-        left.pack(side="left", fill="y", padx=(0,10))
+        # TAB 1: OPERATE
+        self.tab_op = tk.Frame(self.nb, bg=C["bg"])
+        self.nb.add(self.tab_op, text=" ⚡ VẬN HÀNH & QUÉT ")
+        
+        top_main = tk.Frame(self.tab_op, bg=C["bg"])
+        top_main.pack(fill="both", expand=True)
+
+        # LEFT COLUMN (340px)
+        left = tk.Frame(top_main, bg=C["bg"], width=350)
+        left.pack(side="left", fill="y", padx=(10, 5), pady=10)
         left.pack_propagate(False)
 
         self._build_account_section(left)
@@ -320,13 +452,15 @@ class App:
         self._build_filter_section(left)
         self._build_action_section(left)
 
-        # RIGHT
-        right = tk.Frame(main, bg=C["bg"])
-        right.pack(side="left", fill="both", expand=True)
+        # RIGHT COLUMN (Resizable Table & Logs)
+        right = tk.Frame(top_main, bg=C["bg"])
+        right.pack(side="left", fill="both", expand=True, padx=(5, 10), pady=10)
+        self._build_resizable_panel(right)
 
-        self._build_stats(right)
-        self._build_table(right)
-        self._build_log(right)
+        # TAB 2: TEMPLATES
+        self.tab_tpl = tk.Frame(self.nb, bg=C["bg"])
+        self.nb.add(self.tab_tpl, text=" 📜 THƯ VIỆN KỊCH BẢN ")
+        self._build_template_tab(self.tab_tpl)
 
     # ---- ACCOUNT SECTION ----
     def _build_account_section(self, parent):
@@ -431,21 +565,15 @@ class App:
 
         make_label(card, "Link nhóm Zalo:").pack(anchor="w")
         self.link_entry = make_entry(card)
-        self.link_entry.pack(fill="x", pady=(2,4))
+        self.link_entry.pack(fill="x", pady=(2,2))
         self.link_entry.insert(0, "https://zalo.me/g/")
 
-        style = ttk.Style()
-        style.theme_use("clam")
-        style.configure("G.Horizontal.TProgressbar", troughcolor=C["input"],
-                         background=C["green"], thickness=5)
+        # Tiến trình (ẩn đi theo yêu cầu xóa ô thừa)
         self.pvar = tk.DoubleVar()
-        ttk.Progressbar(card, variable=self.pvar, maximum=100,
-                        style="G.Horizontal.TProgressbar").pack(fill="x", pady=(2,2))
         self.plabel = tk.Label(card, text="", font=F["sm"], bg=C["card"], fg=C["dim"])
-        self.plabel.pack(fill="x")
 
         self.scan_btn = Btn(card, "🚀 BẮT ĐẦU QUÉT", cmd=self._do_scan, color=C["green"])
-        self.scan_btn.pack(fill="x", pady=(4,0))
+        self.scan_btn.pack(fill="x", pady=(8,0))
 
     # ---- FILTER ----
     def _build_filter_section(self, parent):
@@ -457,17 +585,15 @@ class App:
                        activebackground=C["card"], activeforeground=C["text"],
                        command=self._apply_filter).pack(anchor="w")
 
-        row = tk.Frame(card, bg=C["card"])
-        row.pack(fill="x", pady=(6,0))
-        Btn(row, "📊 Excel", cmd=self._export_excel, color="#2d6a4f").pack(
-            side="left", expand=True, fill="x", padx=(0,3))
-        Btn(row, "📄 CSV", cmd=self._export_csv, color="#1a535c").pack(
-            side="left", expand=True, fill="x", padx=(3,3))
-        Btn(row, "📋 JSON", cmd=self._export_json, color="#6930c3").pack(
-            side="left", expand=True, fill="x", padx=(3,0))
-
-        Btn(card, "📂 IMPORT Excel (Load data cũ)", cmd=self._import_excel,
-            color="#3f6791").pack(fill="x", pady=(6,0))
+        # --- ROW: EXCEL EXPORT & IMPORT ---
+        row_ex = tk.Frame(card, bg=C["card"])
+        row_ex.pack(fill="x", pady=(4,0))
+        
+        Btn(row_ex, "📗 Xuất Excel", cmd=self._export_excel, color="#065f46"
+            ).pack(side="left", expand=True, fill="x", padx=(0,2))
+            
+        Btn(row_ex, "📂 Import Excel", cmd=self._import_excel, color="#374151"
+            ).pack(side="left", expand=True, fill="x", padx=(2,0))
 
     # ---- ACTION SECTION ----
     def _build_action_section(self, parent):
@@ -492,39 +618,49 @@ class App:
         self.limit_entry.insert(0, "0")
         self.limit_entry.pack(fill="x")
 
-        make_label(card, "Lời nhắn kết bạn:").pack(anchor="w", pady=(4,0))
-        self.friend_msg = make_entry(card)
-        self.friend_msg.insert(0, "Xin chào! Mình muốn kết bạn.")
-        self.friend_msg.pack(fill="x", pady=(2,4))
+        # --- KỊCH BẢN ---
+        make_label(card, "👋 Chọn kịch bản Kết bạn:").pack(anchor="w", pady=(4,0))
+        self.tpl_friend_sel = tk.StringVar()
+        self.tpl_friend_combo = ttk.Combobox(card, textvariable=self.tpl_friend_sel, state="readonly", font=F["body"])
+        self.tpl_friend_combo.pack(fill="x", pady=(2,4))
 
-        make_label(card, "ID nhóm mời / URL nhóm:").pack(anchor="w")
+        make_label(card, "📨 Chọn kịch bản Mời nhóm:").pack(anchor="w", pady=(4,0))
+        self.tpl_invite_sel = tk.StringVar()
+        self.tpl_invite_combo = ttk.Combobox(card, textvariable=self.tpl_invite_sel, state="readonly", font=F["body"])
+        self.tpl_invite_combo.pack(fill="x", pady=(2,4))
+
+        make_label(card, "💬 Chọn kịch bản Nhắn tin:").pack(anchor="w", pady=(4,0))
+        self.tpl_msg_sel = tk.StringVar()
+        self.tpl_msg_combo = ttk.Combobox(card, textvariable=self.tpl_msg_sel, state="readonly", font=F["body"])
+        self.tpl_msg_combo.pack(fill="x", pady=(2,4))
+        
+        # Random Mode Toggle
+        tk.Checkbutton(card, text=" Gửi nội dung Ngẫu nhiên (Ưu tiên)", 
+                       variable=self.use_random, font=F["sm"], bg=C["card"], fg=C["orange"],
+                       selectcolor=C["input"], activebackground=C["card"]).pack(anchor="w", pady=2)
+
+        # --- ĐỊNH DANH NHÓM ---
+        make_label(card, "🆔 ID nhóm mời (mời trực tiếp):").pack(anchor="w")
         self.group_id_entry = make_entry(card)
         self.group_id_entry.pack(fill="x", pady=(2,4))
+        
+        # Biến ẩn để chứa ảnh từ kịch bản (không hiển thị UI chọn ảnh ở đây nữa)
+        self.current_action_image = tk.StringVar(value="")
 
-        # Chọn ảnh
-        self.image_path = tk.StringVar(value="Chưa chọn ảnh...")
-        row_img = tk.Frame(card, bg=C["card"])
-        row_img.pack(fill="x", pady=(4,2))
-        make_label(row_img, "Hình ảnh quảng cáo:").pack(side="left")
-        tk.Label(card, textvariable=self.image_path, font=F["sm"],
-                 bg=C["card"], fg=C["accent"], wraplength=280).pack(fill="x")
-        Btn(card, "🖼️ Chọn ảnh gửi kèm", cmd=self._pick_image, color="#4b5563").pack(fill="x", pady=(2,4))
-
-        self.action_progress = tk.Label(card, text="", font=F["sm"],
-                                        bg=C["card"], fg=C["dim"])
+        self.action_progress = tk.Label(card, text="", font=F["sm"], bg=C["card"], fg=C["dim"])
         self.action_progress.pack(fill="x", pady=(2,2))
 
+        # --- NÚT BẤM ---
         r1 = tk.Frame(card, bg=C["card"])
-        r1.pack(fill="x", pady=(4,3))
-        Btn(r1, "👋 Kết bạn", cmd=self._batch_friend,
-            color=C["accent"]).pack(side="left", expand=True, fill="x", padx=(0,3))
-        Btn(r1, "📨 Mời nhóm", cmd=self._batch_invite,
-            color=C["orange"]).pack(side="left", expand=True, fill="x", padx=(3,0))
+        r1.pack(fill="x", pady=(4,2))
+        Btn(r1, "👋 Kết bạn", cmd=self._batch_friend, color=C["accent"]).pack(side="left", expand=True, fill="x", padx=(0,3))
+        Btn(r1, "📨 Mời nhóm", cmd=self._batch_invite, color=C["orange"]).pack(side="left", expand=True, fill="x", padx=(3,0))
 
-        Btn(card, "💬 Gửi Tin nhắn + Ảnh (Hiệu quả nhất)", cmd=self._batch_message,
-            color=C["green"]).pack(fill="x", pady=(2,4))
-
+        Btn(card, "💥 GỬI TIN NHẮN (Marketing)", cmd=self._batch_message, color=C["green"]).pack(fill="x", pady=(2,2))
         self.stop_btn = Btn(card, "⛔ DỪNG", cmd=self._do_cancel, color=C["red"])
+        self.stop_btn.pack(fill="x", pady=(2,0))
+
+        self._refresh_action_combos()
         self.stop_btn.pack(fill="x", pady=(2,0))
 
         # ---- Scan History ----
@@ -536,7 +672,7 @@ class App:
                                           state="readonly", font=F["mono"])
         self.history_combo.pack(fill="x", pady=(2,2))
         self._refresh_history()
-        Btn(card, "📂 Load data đã lưu", cmd=self._load_history_item,
+        Btn(card, "📗 Load Excel đã lưu", cmd=self._load_history_item,
             color="#374151").pack(fill="x", pady=(2,0))
 
     # ---- STATS ----
@@ -560,88 +696,82 @@ class App:
         self.s_member_f, self.s_member = stat(row, "✅", "Mems", C["green"])
         self.s_member_f.pack(side="left", fill="x", expand=True, padx=(2,0))
 
-    # ---- TABLE ----
-    def _build_table(self, parent):
-        tf = tk.Frame(parent, bg=C["card"], highlightbackground=C["border"], highlightthickness=1)
-        tf.pack(fill="both", expand=True, pady=(0,6))
 
-        hdr = tk.Frame(tf, bg=C["card2"], pady=5, padx=8)
+    # ---- TABLE & LOGS (RESIZABLE) ----
+    def _build_resizable_panel(self, parent):
+        self.pane = tk.PanedWindow(parent, orient="vertical", bg=C["bg"], sashwidth=4, sashrelief="flat")
+        self.pane.pack(fill="both", expand=True)
+
+        # Upper: Table Area
+        tf = tk.Frame(self.pane, bg=C["bg"])
+        self.pane.add(tf, minsize=300)
+        
+        # Add stats first
+        self._build_stats(tf)
+
+        # Table Frame
+        tbl_f = tk.Frame(tf, bg=C["card"], highlightbackground=C["border"], highlightthickness=1)
+        tbl_f.pack(fill="both", expand=True)
+
+        hdr = tk.Frame(tbl_f, bg=C["card2"], pady=5, padx=8)
         hdr.pack(fill="x")
-        self.tbl_title = tk.Label(hdr, text="📋 DANH SÁCH THÀNH VIÊN", font=F["h2"],
-                                  bg=C["card2"], fg=C["text"])
+        self.tbl_title = tk.Label(hdr, text="📋 DANH SÁCH THÀNH VIÊN", font=F["h2"], bg=C["card2"], fg=C["text"])
         self.tbl_title.pack(side="left")
         
-        # Select All Buttons
         sel_row = tk.Frame(hdr, bg=C["card2"])
         sel_row.pack(side="right")
-        tk.Button(sel_row, text="☑ Tất cả", font=F["sm"], bg="#2d3748", fg="white", 
-                  relief="flat", padx=5, command=lambda: self._toggle_all(True)).pack(side="left", padx=2)
-        tk.Button(sel_row, text="☐ Bỏ chọn", font=F["sm"], bg="#2d3748", fg="white", 
-                  relief="flat", padx=5, command=lambda: self._toggle_all(False)).pack(side="left", padx=2)
+        Btn(sel_row, "✅ Tất cả", cmd=lambda: self._toggle_all(True), color=C["accent"], font=F["sm"]).pack(side="left", padx=5)
+        Btn(sel_row, "⬜ Bỏ chọn", cmd=lambda: self._toggle_all(False), color="#374151", font=F["sm"]).pack(side="left")
 
-        self.tbl_count = tk.Label(hdr, text="", font=("Segoe UI",8,"bold"),
-                                  bg=C["accent"], fg="white", padx=6, pady=1)
-        self.tbl_count.pack(side="right", padx=(10,0))
-
-        cols = ("check", "stt", "id", "name", "zname", "role", "status")
-        st = ttk.Style()
-        st.configure("T.Treeview", background=C["card"], foreground=C["text"],
-                      fieldbackground=C["card"], borderwidth=0, font=F["sm"], rowheight=28)
-        st.configure("T.Treeview.Heading", background=C["card2"], foreground=C["bright"],
-                      font=F["body"], borderwidth=0, relief="flat")
-        st.map("T.Treeview", background=[("selected",C["grad1"])], foreground=[("selected","white")])
-
-        tc = tk.Frame(tf, bg=C["card"])
+        tc = tk.Frame(tbl_f, bg=C["card"])
         tc.pack(fill="both", expand=True, padx=1)
-        self.tree = ttk.Treeview(tc, columns=cols, show="headings", style="T.Treeview",
-                                  selectmode="extended")
+        
+        cols = ("check", "stt", "id", "name", "zname", "friend", "invite", "msg", "status")
+        self.tree = ttk.Treeview(tc, columns=cols, show="headings", style="T.Treeview", selectmode="extended")
         
         col_defs = [
             ("check", "Chon", 35, "center"),
-            ("stt", "STT", 45, "center"),
+            ("stt", "STT", 40, "center"),
             ("id", "Zalo ID", 155, "w"),
-            ("name", "Tên hiển thị", 180, "w"),
-            ("zname", "Tên Zalo", 150, "w"),
-            ("role", "Vai trò", 100, "center"),
-            ("status", "Trạng thái", 120, "center")
+            ("name", "Tên hiển thị", 210, "w"),
+            ("zname", "Tên Zalo", 160, "w"),
+            ("friend", "Kết bạn", 80, "center"),
+            ("invite", "Mời nhóm", 80, "center"),
+            ("msg", "Nhắn tin", 80, "center"),
+            ("status", "Kết quả", 120, "center")
         ]
-        
-        for cid, txt, w, anc in col_defs:
-            self.tree.heading(cid, text=txt if cid != "check" else "☑")
-            self.tree.column(cid, width=w, minwidth=w, anchor=anc)
+        for cid, head, w, anc in col_defs:
+            self.tree.heading(cid, text=head if cid != "check" else "☑")
+            self.tree.column(cid, width=w, anchor=anc)
 
         self.tree.tag_configure("ok", foreground=C["green"])
         self.tree.tag_configure("warn", foreground=C["yellow"])
         self.tree.tag_configure("error", foreground=C["red"])
-        self.tree.tag_configure("owner", foreground=C["red"])
-        self.tree.tag_configure("admin", foreground=C["yellow"])
-        self.tree.tag_configure("stripe", background=C["stripe"])
-        
-        # Click checkbox toggle
         self.tree.bind("<Button-1>", self._on_tree_click)
-
+        
+        self.tree.pack(side="left", fill="both", expand=True)
         sb = ttk.Scrollbar(tc, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
-        self.tree.pack(fill="both", expand=True)
+        self.tree.configure(yscrollcommand=sb.set)
 
-    # ---- LOG ----
-    def _build_log(self, parent):
-        lf = tk.Frame(parent, bg=C["card"], highlightbackground=C["border"],
-                      highlightthickness=1, height=110)
-        lf.pack(fill="x"); lf.pack_propagate(False)
+        # Lower: Logs
+        lf = tk.Frame(self.pane, bg=C["card"], highlightbackground=C["border"], highlightthickness=1)
+        self.pane.add(lf, minsize=100)
+
         tk.Frame(lf, bg=C["card2"], pady=3, padx=8).pack(fill="x")
-        tk.Label(lf, text="📝 LOG", font=F["body"], bg=C["card2"], fg=C["dim"]).place(x=8, y=2)
+        tk.Label(lf, text="📝 NHẬT KÝ HOẠT ĐỘNG (Có thể kéo dãn)", font=F["body"], bg=C["card2"], fg=C["dim"]).place(x=8, y=2)
+        
         self.log = tk.Text(lf, font=F["mono"], bg=C["card"], fg=C["dim"], height=4,
                            state="disabled", relief="flat", bd=6, wrap="word")
         self.log.pack(fill="both", expand=True, pady=(20,0))
         for t,c in [("info",C["accent"]),("ok",C["green"]),("warn",C["yellow"]),("error",C["red"])]:
             self.log.tag_configure(t, foreground=c)
 
-    def _log(self, msg, tag="info"):
+    def _log(self, msg, tag="info", acc_name=None):
         ts = datetime.now().strftime("%H:%M:%S")
+        prefix = f"[Acc:{acc_name}] " if acc_name else ""
         self.log.config(state="normal")
-        self.log.insert("end", f"[{ts}] {msg}\n", tag)
+        self.log.insert("end", f"[{ts}] {prefix}{msg}\n", tag)
         self.log.see("end")
         self.log.config(state="disabled")
 
@@ -659,66 +789,136 @@ class App:
         else:
             self.login_status.config(text="❌ Bridge failed", fg=C["red"])
 
-    def _evt(self, eid, data):
+    def _evt(self, eid, d):
         if eid == "ready":
+            self.login_status.config(text="🔵 Bridge sẵn sàng", fg=C["accent"])
+            self._log("Hệ thống Bridge đã hoạt động.", "ok")
             if self.accounts:
-                self.login_status.config(text="⚡ Tự động đăng nhập...", fg=C["yellow"])
-                self._log("⚡ Tìm thấy tài khoản đã lưu, tự động đăng nhập...")
                 self.root.after(300, self._do_login)
-            else:
-                self.login_status.config(text="🟢 Sẵn sàng — Thêm tài khoản để bắt đầu", fg=C["green"])
-                self._log("Bridge sẵn sàng.", "ok")
         elif eid == "scan_progress":
-            t = data.get("totalMember",1)
-            f = data.get("totalFetched",0)
-            p = min(100, f/max(t,1)*100)
-            self.pvar.set(p)
-            self.plabel.config(text=f"Trang {data.get('page')} • {f}/{t} ({p:.0f}%)")
-        elif eid == "scan_error":
-            self._log(f"⚠ Lỗi trang {data.get('page')}: {data.get('error')}", "warn")
-        elif eid == "batch_progress":
-            d = data
-            act = {"friend_request":"Kết bạn","add_to_group":"Thêm vào nhóm",
-                   "invite_to_group":"Mời vào nhóm", "send_message": "Gửi tin"}.get(d.get("action"), d.get("action"))
-            ok_icon = "✅" if d.get("ok") else "❌"
-            self.action_progress.config(
-                text=f"{act}: {d.get('current')}/{d.get('total')} | ✅{d.get('successCount')} ❌{d.get('failCount')}")
-            uid = d.get("userId","")
-            
-            # Cập nhật trạng thái trong bảng
-            for item_id in self.tree.get_children():
-                vals = list(self.tree.item(item_id, "values"))
-                if vals[2] == uid:
-                    new_status = "Thành công" if d.get("ok") else "Thất bại"
-                    vals[6] = new_status
-                    self.tree.item(item_id, values=vals, tags=(*self.tree.item(item_id,"tags"), "ok" if d.get("ok") else "error"))
-                    break
+            fetched = d.get('fetched', 0)
+            self.plabel.config(text=f"Đang quét trang {d.get('page')}... ({fetched} mems)")
+            # Indeterminate progress or based on a guess
+            self.pvar.set((self.pvar.get() + 5) % 100)
 
-            if d.get("ok"):
-                self._log(f"✅ {act} {uid} ({d.get('current')}/{d.get('total')})", "ok")
+    def _batch_progress_handler(self, d, err, acc_name, act):
+        if err:
+            self.root.after(0, self._log, f"❌ Lỗi {act}: {err}", "error", acc_name)
+            return
+        if not d: return
+        
+        # Check message type: progress (has 'current'), debug (has 'action' but no 'current'), or final (has 'success')
+        if "current" in d:
+            target_id = str(d.get("uid") or "")
+            ok = d.get("ok", False)
+            curr = d.get("current", 0)
+            total = d.get("total", 0)
+            
+            # Chỉ cập nhật trạng thái "đã gửi" khi THÀNH CÔNG
+            members = self.scan_result.get("members", [])
+            found_member = None
+            for m in members:
+                if str(m.get("id")) == target_id:
+                    if ok:  # CHỈ đánh dấu khi thực sự thành công
+                        if act == "Kết bạn": m["friend_sent"] = True
+                        elif act == "Mời nhóm": m["invite_sent"] = True
+                        elif act == "Nhắn tin": m["message_sent"] = True
+                    found_member = m
+                    break
+            
+            # Cập nhật UI ngay lập tức cho dòng đó
+            if found_member:
+                for item_id in self.tree.get_children():
+                    if str(self.tree.item(item_id, "values")[2]) == target_id:
+                        f_stat = "✅" if found_member.get("friend_sent") else ""
+                        i_stat = "✅" if found_member.get("invite_sent") else ""
+                        m_stat = "✅" if found_member.get("message_sent") else ""
+                        
+                        old_vals = list(self.tree.item(item_id, "values"))
+                        old_vals[5] = f_stat
+                        old_vals[6] = i_stat
+                        old_vals[7] = m_stat
+                        tag = "ok" if ok else "error"
+                        self.tree.item(item_id, values=old_vals, tags=(tag,))
+                        break
+            
+            # Tự động lưu vào Excel để bảo toàn dữ liệu
+            if ok:
+                self._save_scan_data(auto=True)
+            
+            # Log with Account Name
+            if ok:
+                self._log(f"✅ {act} {target_id} ({curr}/{total})", "ok", acc_name)
             else:
-                err_msg = d.get("error", "Không rõ lỗi")
-                self._log(f"❌ {act} {uid} thất bại: {err_msg} ({d.get('current')}/{d.get('total')})", "warn")
+                self._log(f"❌ {act} {target_id} lỗi: {d.get('error','?')}", "warn", acc_name)
+            
+            # Update progress label
+            self.action_progress.config(text=f"{act}: {curr}/{total}")
+            
+            # Update Table View
+            self.root.after(0, self._update_row_status, target_id, act, ok)
+        elif "action" in d and "current" not in d:
+            # Debug/info message from bridge (e.g. invite_debug) - just log, don't say "done"
+            self._log(f"ℹ️ {act}: {d}", "info", acc_name)
+        elif "success" in d:
+            # Final result from the batch
+            ok_count = d.get("successCount", 0)
+            fail_count = d.get("failCount", 0)
+            self._log(f"🏁 Xong {act} tài khoản {acc_name}: ✅{ok_count} ❌{fail_count}", "ok", acc_name)
+            self.action_progress.config(text=f"Hoàn thành {act}")
+            self._save_last_session()
+        else:
+            # Unknown format, log it
+            self._log(f"🏁 Xong {act} tài khoản {acc_name}", "ok", acc_name)
+
+    def _update_row_status(self, uid, act, ok):
+        if not self.scan_result: return
+        mems = self.scan_result.get("members", [])
+        
+        # Mapping hành động sang cột và thuộc tính
+        # Index: 5:Kết bạn, 6:Mời nhóm, 7:Nhắn tin
+        action_map = {
+            "Kết bạn": {"idx": 5, "attr": "friend_sent"},
+            "Mời nhóm": {"idx": 6, "attr": "invite_sent"},
+            "Nhắn tin": {"idx": 7, "attr": "message_sent"}
+        }
+        
+        cfg = action_map.get(act)
+        if not cfg: return
+
+        # Update bộ nhớ
+        for m in mems:
+            if str(m.get("id")) == str(uid):
+                if ok: m[cfg["attr"]] = True
+                break
+
+        # Update Treeview
+        for item_id in self.tree.get_children():
+            vals = list(self.tree.item(item_id, "values"))
+            if str(vals[2]) == str(uid):
+                vals[cfg["idx"]] = "✅" if ok else "❌"
+                vals[8] = "Thành công" if ok else "Lỗi"
+                self.tree.item(item_id, values=vals, tags=("ok" if ok else "error"))
+                break
 
     # ============================================================
     # LOGIN
     # ============================================================
     def _do_login(self):
-        if not self.bridge: return
-        idx = self.acc_combo.current()
-        if idx < 0 or idx >= len(self.accounts):
-            messagebox.showwarning("Chọn tài khoản", "Thêm tài khoản trước!")
-            return
-        acc = self.accounts[idx]
-        self.current_account = acc
+        acc = self._get_current_acc()
+        if not acc: return
         self.login_status.config(text="⏳ Đang đăng nhập...", fg=C["yellow"])
-        self._log(f"Đăng nhập: {acc.get('name', '?')}...")
+        self._log(f"Đăng nhập: {acc['name']}...", "info", acc['name'])
 
         def cb(data, err):
-            self.root.after(0, self._login_result, data, err)
-        self.bridge.send("login_cookie", {
+            if err: self._log(f"Lỗi: {err}", "error", acc['name'])
+            elif data: 
+                self.root.after(0, lambda: self.login_status.config(text=f"🟢 {acc['name']} OK", fg=C["green"]))
+                self._log(f"Đăng nhập thành công!", "ok", acc['name'])
+
+        self.bridge.send("login", {
             "imei": acc["imei"], "cookie": acc["cookie"],
-            "userAgent": acc.get("userAgent", DEFAULT_USER_AGENT),
+            "userAgent": acc.get("userAgent", DEFAULT_USER_AGENT)
         }, cb)
 
     def _login_result(self, data, err):
@@ -736,59 +936,54 @@ class App:
             self.login_status.config(text=f"❌ {msg}", fg=C["red"])
             self._log(f"Thất bại: {msg}", "error")
 
-    # ============================================================
+    # = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = 
     # SCAN
-    # ============================================================
+    # = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = 
     def _do_scan(self):
-        if not self.logged_in:
-            messagebox.showwarning("!", "Đăng nhập trước!")
-            return
         link = self.link_entry.get().strip()
         if "zalo.me/g/" not in link:
-            messagebox.showwarning("!", "Link phải có dạng https://zalo.me/g/xxxxx")
-            return
-        self.scan_btn.set_enabled(False)
-        self.pvar.set(0)
+            return messagebox.showwarning("!", "Link phải có dạng https://zalo.me/g/xxxxx")
+        
+        acc = self._get_current_acc()
+        if not acc: return messagebox.showwarning("!", "Chọn tài khoản trước!")
+
+        acc_name = acc.get("name", "Acc")
+        self._log(f"🔎 Bắt đầu quét: {link}", "info", acc_name)
         self.plabel.config(text="Đang quét...")
-        self._log(f"🔍 Quét: {link}")
 
-        def cb(d, e): self.root.after(0, self._scan_done, d, e)
-        self.bridge.send("scan_group", {"link": link}, cb)
+        def thread_task():
+            params = {"link": link, "imei": acc['imei'], "cookie": acc['cookie']}
+            def cb(data, err):
+                if err: self._log(f"Lỗi quét: {err}", "error", acc_name)
+                elif data and data.get("success"):
+                    self.root.after(0, self._process_scan_result, data, acc_name)
+            self.bridge.send("scan_group", params, cb)
 
-    def _scan_done(self, data, err):
-        self.scan_btn.set_enabled(True)
-        if err:
-            self.plabel.config(text=f"❌ {err}")
-            self._log(f"Lỗi: {err}", "error")
-            return
-        if not data or not data.get("success"):
-            m = data.get("message","?") if data else "?"
-            self.plabel.config(text=f"❌ {m}")
-            self._log(f"Lỗi: {m}", "error")
-            return
-        self.scan_result = data
-        g = data.get("groupInfo",{})
-        n = len(data.get("members",[]))
-        self.pvar.set(100)
-        gid = g.get('groupId','?')
-        self.plabel.config(text=f"✅ {n}/{g.get('totalMember','?')} thành viên")
-        self._log(f"✅ Quét xong \"{g.get('name')}\" — {n} thành viên", "ok")
-        self._log(f"🆔 Mã ID Nhóm này: {gid} (Dùng để mời nhóm)", "info")
+        threading.Thread(target=thread_task, daemon=True).start()
 
-        # Tự động lưu data
+    def _process_scan_result(self, data, acc_name):
+        self.plabel.config(text="✅ Đã quét xong!")
+        
         try:
             fp = self._save_scan_data(data)
-            self._log(f"📂 Đã tự động lưu: {fp.name}", "ok")
-            self._refresh_history()
+            self._log(f"📂 Quét & Gộp xong: {len(self.scan_result['members'])} mms", "ok", acc_name)
+            self._apply_filter()
             self._save_last_session()
         except Exception as e:
-            self._log(f"Không thể tự động lưu: {e}", "warn")
-
-        self._apply_filter()
+            self._log(f"Lỗi lưu data: {e}", "warn")
 
     def _refresh_history(self):
         self.scan_history = self._load_scan_history()
-        names = [f"({h['count']}) {h['name']} - {h['time'][:16].replace('T',' ')}" for h in self.scan_history]
+        names = []
+        for h in self.scan_history:
+            # Lấy thời gian sửa đổi file
+            try:
+                mtime = h["file"].stat().st_mtime
+                ts = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+            except:
+                ts = "N/A"
+            names.append(f"{h['name']} ({ts})")
+            
         self.history_combo["values"] = names
         if names: self.history_combo.current(0)
 
@@ -796,18 +991,50 @@ class App:
         idx = self.history_combo.current()
         if idx < 0: return
         item = self.scan_history[idx]
+        self._import_excel_file(str(item["file"]))
+
+    def _import_excel_file(self, fp):
+        if not HAS_OPENPYXL:
+            messagebox.showerror("!", "Cần cài openpyxl để load Excel.")
+            return
+        
         try:
-            d = json.loads(item["file"].read_text("utf-8"))
-            # Convert save format back to scan result format
+            wb = load_workbook(fp, data_only=True)
+            ws = wb.active
+            
+            # Read Group Meta from row 1
+            g_name = str(ws.cell(row=1, column=1).value or "").replace("Nhóm:", "").strip()
+            g_id = str(ws.cell(row=1, column=2).value or "").replace("ID:", "").strip()
+            
+            members = []
+            header_row = 4 # Based on our new template
+            
+            for r in range(header_row + 1, ws.max_row + 1):
+                mid = str(ws.cell(row=r, column=3).value or "").strip()
+                if not mid or mid == "None": continue
+                
+                name = str(ws.cell(row=r, column=4).value or "").strip()
+                zname = str(ws.cell(row=r, column=5).value or "").strip()
+                role = str(ws.cell(row=r, column=6).value or "").strip()
+                f_sent = str(ws.cell(row=r, column=7).value or "").lower() == "v"
+                i_sent = str(ws.cell(row=r, column=8).value or "").lower() == "v"
+                m_sent = str(ws.cell(row=r, column=9).value or "").lower() == "v"
+                
+                members.append({
+                    "id": mid, "dName": name, "zaloName": zname, "role": role,
+                    "friend_sent": f_sent, "invite_sent": i_sent, "message_sent": m_sent
+                })
+
             self.scan_result = {
-                "success": True,
-                "groupInfo": d.get("group"),
-                "members": d.get("members")
+                "groupInfo": {"name": g_name, "groupId": g_id},
+                "members": members
             }
-            self._log(f"📂 Đã load data từ: {item['file'].name}", "ok")
+            self.current_data_file = Path(fp)
+            self._log(f"📥 Đã tải {len(members)} mms từ Excel: {self.current_data_file.name}", "ok")
             self._apply_filter()
+            
         except Exception as e:
-            messagebox.showerror("Lỗi", f"Không thể load file: {e}")
+            messagebox.showerror("Lỗi", f"Không thể đọc file Excel: {e}")
 
     def _do_cancel(self):
         if self.bridge:
@@ -828,16 +1055,14 @@ class App:
         all_d = []
         ac = 0
         for m in mems:
-            mid = m.get("id","")
-            
-            # Nếu data đã có role sẵn (từ Excel import hoặc history)
+            mid = str(m.get("id") or "")
             existing_role = m.get("role")
             
             if mid == cid:
                 role, is_a = "👑 Trưởng nhóm", True
             elif mid in aids:
                 role, is_a = "⭐ Phó nhóm", True
-            if existing_role and ("Trưởng" in str(existing_role) or "Phó" in str(existing_role)):
+            elif existing_role and ("Trưởng" in str(existing_role) or "Phó" in str(existing_role)):
                 role, is_a = existing_role, True
             else:
                 role, is_a = existing_role or "Thành viên", False
@@ -849,6 +1074,9 @@ class App:
                 "zaloName": m.get("zaloName",""), 
                 "role": role, 
                 "is_admin": is_a,
+                "friend_sent": m.get("friend_sent", False),
+                "invite_sent": m.get("invite_sent", False),
+                "message_sent": m.get("message_sent", False),
                 "status": m.get("last_status", "Sẵn sàng"),
                 "checked": m.get("checked", True)
             })
@@ -868,17 +1096,30 @@ class App:
             if i%2==1: tags.append("stripe")
             
             check_mark = "☑" if m["checked"] else "☐"
+            f_mark = "✅" if m["friend_sent"] else ""
+            i_mark = "✅" if m["invite_sent"] else ""
+            m_mark = "✅" if m["message_sent"] else ""
             
-            self.tree.insert("","end", values=(check_mark, i+1, m["id"], m["dName"], m["zaloName"], m["role"], m["status"]),
-                            tags=tuple(tags))
+            # vals: check, stt, id, name, zname, friend, invite, msg, status
+            vals = (check_mark, i+1, m["id"], m["dName"], m["zaloName"], f_mark, i_mark, m_mark, m["status"])
+            self.tree.insert("","end", values=vals, tags=tuple(tags))
 
-        ft = "(lọc admin)" if self.filter_admin.get() else "(tất cả)"
-        self.tbl_count.config(text=f" {len(self.filtered)} {ft} ")
-        self.tbl_title.config(text=f"📋 {g.get('name','N/A')}")
+        ft = "(đã lọc)" if self.filter_admin.get() else ""
+        self.tbl_title.config(text=f"📋 {g.get('name','N/A')} {ft}")
 
     # ============================================================
     # EXPORT
     # ============================================================
+    def _save_template(self, name, content, t_type):
+        # ... logic lưu ...
+        self._refresh_tpl_combos()
+        self._refresh_tpl_table()
+
+    def _delete_template(self, name):
+        # ... logic xóa ...
+        self._refresh_tpl_combos()
+        self._refresh_tpl_table()
+
     def _safe_name(self, n):
         return re.sub(r'[<>:"/\\|?*]', '_', n or "group")[:80]
 
@@ -919,7 +1160,7 @@ class App:
         ws.append([])
 
         # Header
-        headers = ["STT", "Zalo ID", "Tên hiển thị", "Tên Zalo", "Vai trò"]
+        headers = ["STT", "Zalo ID", "Tên hiển thị", "Tên Zalo", "Vai trò", "Kết bạn", "Mời nhóm"]
         ws.append(headers)
         for cell in ws[6]:
             cell.font = hdr_font
@@ -927,9 +1168,10 @@ class App:
             cell.alignment = Alignment(horizontal="center")
             cell.border = border
 
-        # Data
         for i, m in enumerate(self.filtered):
-            row = [i+1, m["id"], m["dName"], m["zaloName"], m["role"]]
+            f_stat = "v" if m.get("friend_sent") else ""
+            i_stat = "v" if m.get("invite_sent") else ""
+            row = [i+1, m["id"], m["dName"], m["zaloName"], m["role"], f_stat, i_stat]
             ws.append(row)
             for cell in ws[ws.max_row]:
                 cell.border = border
@@ -945,37 +1187,6 @@ class App:
         self._log(f"💾 Excel: {fp}", "ok")
         messagebox.showinfo("✅", f"Đã xuất {len(self.filtered)} thành viên!\n{fp}")
 
-    def _export_csv(self):
-        fp = self._get_save_path(".csv")
-        if not fp: return
-        g = self.scan_result.get("groupInfo",{}) if self.scan_result else {}
-        with open(fp, "w", newline="", encoding="utf-8-sig") as f:
-            w = csv.writer(f)
-            w.writerow([f"# Nhóm: {g.get('name','')}"])
-            w.writerow([f"# Tổng: {g.get('totalMember','')}"])
-            w.writerow([f"# Lúc: {datetime.now().strftime('%Y-%m-%d %H:%M')}"])
-            w.writerow([])
-            w.writerow(["STT","Zalo ID","Tên hiển thị","Tên Zalo","Vai trò"])
-            for i,m in enumerate(self.filtered):
-                w.writerow([i+1, m["id"], m["dName"], m["zaloName"], m["role"]])
-        self._log(f"💾 CSV: {fp}", "ok")
-        messagebox.showinfo("✅", f"Đã xuất {len(self.filtered)} thành viên!\n{fp}")
-
-    def _export_json(self):
-        fp = self._get_save_path(".json")
-        if not fp: return
-        g = self.scan_result.get("groupInfo",{}) if self.scan_result else {}
-        data = {
-            "group": {"id":g.get("groupId"),"name":g.get("name"),"totalMember":g.get("totalMember")},
-            "scanTime": datetime.now().isoformat(),
-            "count": len(self.filtered),
-            "members": [{"i":i+1,"id":m["id"],"name":m["dName"],"zalo":m["zaloName"],"role":m["role"]}
-                        for i,m in enumerate(self.filtered)],
-        }
-        Path(fp).write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
-        self._log(f"💾 JSON: {fp}", "ok")
-        messagebox.showinfo("✅", f"Đã xuất {len(self.filtered)} thành viên!\n{fp}")
-
     def _import_excel(self):
         if not HAS_OPENPYXL:
             messagebox.showerror("!", "Cần cài openpyxl để load Excel.")
@@ -985,64 +1196,9 @@ class App:
             title="Chọn file Excel",
             filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")]
         )
-        if not fp: return
-
-        try:
-            import openpyxl
-            wb = openpyxl.load_workbook(fp)
-            ws = wb.active
-            
-            group_name = "Imported"
-            # Thử tìm tên nhóm ở dòng 1
-            row1 = str(ws.cell(row=1, column=1).value or "")
-            if "Nhóm:" in row1:
-                group_name = row1.replace("Nhóm:", "").strip()
-
-            members = []
-            # Tìm dòng header (thường là dòng 6 dựa trên cấu trúc export)
-            header_row = 1
-            for r in range(1, 10):
-                if str(ws.cell(row=r, column=2).value).strip() == "Zalo ID":
-                    header_row = r
-                    break
-            
-            for r in range(header_row + 1, ws.max_row + 1):
-                cell_val = ws.cell(row=r, column=2).value
-                if cell_val is None: continue
-                
-                # Xử lý số lớn trong Excel không bị biến thành 1.23E+18
-                if isinstance(cell_val, (int, float)):
-                    mid = "{:.0f}".format(cell_val)
-                else:
-                    mid = str(cell_val).strip()
-                
-                name = str(ws.cell(row=r, column=3).value or "").strip()
-                zname = str(ws.cell(row=r, column=4).value or "").strip()
-                role = str(ws.cell(row=r, column=5).value or "").strip()
-                
-                if mid and mid != "None" and len(mid) > 5:
-                    members.append({
-                        "id": mid,
-                        "dName": name,
-                        "zaloName": zname,
-                        "role": role # mapping will be done in _apply_filter
-                    })
-
-            if not members:
-                messagebox.showwarning("!", "Không tìm thấy dữ liệu thành viên hợp lệ trong file Excel!")
-                return
-
-            self.scan_result = {
-                "success": True,
-                "groupInfo": {"name": group_name, "groupId": "excel_import"},
-                "members": members
-            }
-            self._log(f"📥 Đã import {len(members)} thành viên từ Excel.", "ok")
-            self._apply_filter()
+        if fp:
+            self._import_excel_file(fp)
             self._save_last_session()
-            
-        except Exception as e:
-            messagebox.showerror("Lỗi", f"Không thể đọc file Excel: {e}")
 
     # ============================================================
     # BATCH ACTIONS
@@ -1085,138 +1241,321 @@ class App:
         try: return max(1, int(float(self.delay_entry.get().strip()))) * 1000
         except: return 5000
 
+    def _get_current_acc(self):
+        idx = self.acc_combo.current()
+        if idx >= 0 and idx < len(self.accounts):
+            return self.accounts[idx]
+        return None
+
+    def _get_ids_for_action(self, action_type=None):
+        ids = self._get_selected_ids()
+        acc = self._get_current_acc()
+        if not acc or not ids: return None, None
+        
+        # Lọc bỏ những người đã được xử lý thành công trước đó
+        m_map = {m["id"]: m for m in self.filtered}
+        final_ids = []
+        
+        for uid in ids:
+            m = m_map.get(str(uid), {})
+            if action_type == "friend" and m.get("friend_sent"): continue
+            if action_type == "invite" and m.get("invite_sent"): continue
+            if action_type == "message" and m.get("message_sent"): continue
+            final_ids.append(str(uid)) # Buộc phải là string để tránh lỗi Bridge làm tròn số
+            
+        if not final_ids:
+            messagebox.showinfo("Thông báo", "Tất cả những người được chọn đã được xử lý trước đó!")
+            return None, None
+            
+        # Kiểm tra nhanh nếu thấy ID có dấu hiệu bị lỗi làm tròn (kết thúc bằng 000)
+        if any(str(uid).endswith("000") for uid in final_ids):
+            self._log("⚠️ Cảnh báo: Phát hiện ID có thể bị sai (do phiên cũ). Nếu mời lỗi, hãy QUÉT LẠI nhóm này.", "warn")
+            
+        limit = self._get_limit()
+        return final_ids[:limit] if limit > 0 else final_ids, acc
+
     def _get_limit(self):
         try: return max(0, int(self.limit_entry.get().strip()))
         except: return 0
 
     def _batch_friend(self):
-        if not self.logged_in:
-            messagebox.showwarning("!", "Đăng nhập trước!")
-            return
-        ids = self._get_selected_ids()
-        if not ids:
-            messagebox.showinfo("!", "Không có thành viên nào!")
-            return
+        actual_ids, acc = self._get_ids_for_action("friend")
+        if not actual_ids: return
         
-        limit = self._get_limit()
-        actual_ids = ids[:limit] if limit > 0 else ids
-        
-        if not messagebox.askyesno("Xác nhận",
-                f"Gửi lời kết bạn đến {len(actual_ids)} người?\n"
-                f"Delay: {self.delay_entry.get()}s/người"):
-            return
-
-        msg = self.friend_msg.get().strip()
         delay = self._get_delay()
-        self.batch_running = True
-        self._log(f"👋 Bắt đầu kết bạn {len(actual_ids)} người (delay {delay}ms)...")
-        self.action_progress.config(text=f"Kết bạn: 0/{len(actual_ids)}...")
+        gid = self.scan_result.get("groupInfo",{}).get("groupId","") if self.scan_result else ""
+        use_rand = self.use_random.get()
+        sel_tpl = self.tpl_friend_sel.get()
+        tpls = self.templates.copy()
 
-        self._save_last_session()
-        def cb(d, e):
-            self.root.after(0, self._batch_done, "Kết bạn", d, e)
-        
-        params = {
-            "userIds": ids, "message": msg, "delayMs": delay, "limit": limit
-        }
-        # Thêm sourceGroupId nếu có
-        if self.scan_result and self.scan_result.get("groupInfo"):
-            params["sourceGroupId"] = self.scan_result["groupInfo"].get("groupId")
+        def run():
+            msg = "Xin chào!"
+            if use_rand:
+                f_tpls = [t for t in tpls if t["type"] == "Kết bạn"]
+                if f_tpls: msg = random.choice(f_tpls)["content"]
+            else:
+                for t in tpls:
+                    if t.get("name") == sel_tpl: msg = t["content"]; break
+            
+            self._log(f"👋 Kết bạn: {len(actual_ids)} người", "info", acc['name'])
+            self.bridge.send("batch_friend_req", {
+                "userIds": actual_ids, "message": msg, "sourceGroupId": gid,
+                "delayMs": delay, "imei": acc['imei'], "cookie": acc['cookie']
+            }, lambda d,e: self.root.after(0, self._batch_progress_handler, d, e, acc['name'], "Kết bạn"))
 
-        self.bridge.send("batch_friend_req", params, cb)
+        threading.Thread(target=run, daemon=True).start()
 
     def _batch_invite(self):
-        if not self.logged_in:
-            messagebox.showwarning("!", "Đăng nhập trước!")
-            return
+        actual_ids, acc = self._get_ids_for_action("invite")
+        if not actual_ids: return
         gid = self.group_id_entry.get().strip()
-        if not gid:
-            messagebox.showwarning("!", "Nhập Group ID của nhóm cần mời vào!")
-            return
-        ids = self._get_selected_ids()
-        if not ids:
-            messagebox.showinfo("!", "Không có thành viên nào!")
-            return
-
-        limit = self._get_limit()
-        actual_ids = ids[:limit] if limit > 0 else ids
-
-        if not messagebox.askyesno("Xác nhận",
-                f"Mời {len(actual_ids)} người vào nhóm {gid}?\n"
-                f"Delay: {self.delay_entry.get()}s/người"):
-            return
-
+        if not gid: return messagebox.showwarning("!", "Nhập ID hoặc Link nhóm!")
         delay = self._get_delay()
-        self.batch_running = True
-        self._log(f"📨 Mời {len(actual_ids)} người vào nhóm {gid}...")
-        self.action_progress.config(text=f"Mời: 0/{len(actual_ids)}...")
-        self._save_last_session()
+        limit = self._get_limit()
 
-        def cb(d, e):
-            self.root.after(0, self._batch_done, "Mời nhóm", d, e)
-        self.bridge.send("invite_to_group", {
-            "groupId": gid, "userIds": ids, "delayMs": delay, "limit": limit
-        }, cb)
+        def run():
+            self._log(f"📨 Mời nhóm: {len(actual_ids)} người → {gid}", "info", acc['name'])
+            self.bridge.send("invite_to_group", {
+                "userIds": actual_ids, "groupId": gid, "delayMs": delay,
+                "limit": limit,
+                "imei": acc['imei'], "cookie": acc['cookie']
+            }, lambda d,e: self.root.after(0, self._batch_progress_handler, d, e, acc['name'], "Mời nhóm"))
 
-    def _batch_done(self, action, data, err):
-        self.batch_running = False
-        if err:
-            self._log(f"❌ {action} lỗi: {err}", "error")
-            self.action_progress.config(text=f"❌ {err}")
-            return
-        if data:
-            if data.get("cancelled"):
-                self._log(f"⛔ {action} đã bị dừng bởi người dùng.", "warn")
-                self.action_progress.config(text=f"⛔ Đã dừng.")
-                return
-            s, f, t = data.get("successCount",0), data.get("failCount",0), data.get("total",0)
-            self._log(f"✅ {action} xong: {s}/{t} thành công, {f} thất bại", "ok")
-            self.action_progress.config(text=f"✅ {s}/{t} thành công · {f} thất bại")
-
-    # ---- CLEANUP ----
-    def _pick_image(self):
-        fp = filedialog.askopenfilename(
-            title="Chọn ảnh quảng cáo",
-            filetypes=[("Image files", "*.jpg *.jpeg *.png *.webp"), ("All files", "*.*")]
-        )
-        if fp:
-            self.image_path.set(fp)
+        threading.Thread(target=run, daemon=True).start()
 
     def _batch_message(self):
-        if not self.logged_in:
-            messagebox.showwarning("!", "Đăng nhập trước!")
-            return
-        ids = self._get_selected_ids()
-        if not ids:
-            messagebox.showinfo("!", "Không có thành viên nào!")
-            return
+        actual_ids, acc = self._get_ids_for_action("message")
+        if not actual_ids: return
         
         limit = self._get_limit()
-        actual_ids = ids[:limit] if limit > 0 else ids
-        img = self.image_path.get()
-        msg = self.friend_msg.get().strip()
-        
-        if not messagebox.askyesno("Xác nhận",
-                f"Gửi tin nhắn + ảnh cho {len(actual_ids)} người?\n"
-                f"Delay: {self.delay_entry.get()}s/người"):
-            return
-
         delay = self._get_delay()
-        self.batch_running = True
-        self._log(f"💬 Bắt đầu gửi tin nhắn {len(actual_ids)} người...")
-        self.action_progress.config(text=f"Tin nhắn: 0/{len(actual_ids)}...")
-        self._save_last_session()
 
-        def cb(d, e):
-            self.root.after(0, self._batch_done, "Gửi tin nhắn", d, e)
+        # Capture current state for this specific thread
+        use_rand = self.use_random.get()
+        sel_tpl_name = self.tpl_msg_sel.get()
+        tpls = self.templates.copy()
+
+        def run_thread():
+            msg = "Chào bạn!"
+            img = ""
+            if use_rand:
+                m_tpls = [t for t in tpls if t["type"] == "Nhắn tin"]
+                if m_tpls:
+                    chosen = random.choice(m_tpls)
+                    msg = chosen["content"]
+                    img = chosen.get("image", "")
+            else:
+                for t in tpls:
+                    if t.get("name") == sel_tpl_name:
+                        msg = t["content"]
+                        img = t.get("image", "")
+                        break
+            
+            self._log(f"💬 Gửi tin: {len(actual_ids)} người (Acc:{acc['name']})", "info", acc['name'])
+            self._log(f"📝 Nội dung: '{msg[:50]}...' | Ảnh: '{img or 'không'}' | Random: {use_rand} | Tpl: '{sel_tpl_name}'", "info", acc['name'])
+            
+            # Lấy ID nhóm nguồn để gửi tin nhắn cho người cùng nhóm (kể cả người lạ)
+            gid = self.scan_result.get("groupInfo", {}).get("groupId", "") if self.scan_result else ""
+            
+            def cb(d, e):
+                self.root.after(0, self._batch_progress_handler, d, e, acc['name'], "Nhắn tin")
+            
+            self.bridge.send("batch_send_msg", {
+                "userIds": actual_ids, "message": msg, "imagePath": img if img else None,
+                "delayMs": delay, "limit": limit, "sourceGroupId": gid,
+                "imei": acc['imei'], "cookie": acc['cookie']
+            }, cb)
+
+        threading.Thread(target=run_thread, daemon=True).start()
+
+    # ---- Templates Manager ----
+    def _load_templates(self):
+        try:
+            if TEMPLATES_FILE.exists():
+                return json.loads(TEMPLATES_FILE.read_text("utf-8"))
+        except: pass
+        return [
+            {"type": "Kết bạn", "content": "Xin chào! Mình muốn kết bạn."},
+            {"type": "Nhắn tin", "content": "Chào bạn, mời bạn tham gia nhóm zalo của mình: https://zalo.me/g/..."}
+        ]
+
+    def _save_templates(self):
+        TEMPLATES_FILE.write_text(json.dumps(self.templates, ensure_ascii=False, indent=2), "utf-8")
+
+    def _build_template_tab(self, parent):
+        # Header for the tab
+        head = tk.Frame(parent, bg=C["card2"], pady=10)
+        head.pack(fill="x")
+        tk.Label(head, text="📜 THƯ VIỆN KỊCH BẢN CHỐNG SPAM", font=F["h2"], bg=C["card2"], fg=C["bright"]).pack()
+
+        main = tk.Frame(parent, bg=C["bg"], padx=15, pady=15)
+        main.pack(fill="both", expand=True)
+
+        # Left: List of templates
+        left = tk.Frame(main, bg=C["bg"])
+        left.pack(side="left", fill="both", expand=True, padx=(0,10))
         
-        self.bridge.send("batch_send_msg", {
-            "userIds": ids, 
-            "message": msg, 
-            "imagePath": img,
-            "delayMs": delay, 
-            "limit": limit
-        }, cb)
+        make_label(left, "Danh sách kịch bản hiện có:").pack(anchor="w")
+        
+        # Style for Treeview in this tab
+        s = ttk.Style()
+        s.configure("Tpl.Treeview", rowheight=30)
+        
+        self.tpl_tree = ttk.Treeview(left, columns=("name", "type", "content"), show="headings", height=15, style="Tpl.Treeview")
+        self.tpl_tree.heading("name", text="Tên kịch bản")
+        self.tpl_tree.heading("type", text="Loại")
+        self.tpl_tree.heading("content", text="Nội dung")
+        self.tpl_tree.column("name", width=150, anchor="w")
+        self.tpl_tree.column("type", width=100, anchor="center")
+        self.tpl_tree.column("content", width=350, anchor="w")
+        self.tpl_tree.pack(fill="both", expand=True)
+        self.tpl_tree.bind("<<TreeviewSelect>>", self._on_tpl_select)
+
+        # Right: Editor
+        right = tk.Frame(main, bg=C["card"], padx=15, pady=15, highlightthickness=1, highlightbackground=C["border"], width=380)
+        right.pack(side="right", fill="y")
+        right.pack_propagate(False)
+        
+        make_label(right, "1. Loại kịch bản:").pack(anchor="w")
+        self.tpl_type_var = tk.StringVar(value="Kết bạn")
+        cb = ttk.Combobox(right, textvariable=self.tpl_type_var, 
+                          values=["Kết bạn", "Nhắn tin", "Mời nhóm"], state="readonly", font=F["body"])
+        cb.pack(fill="x", pady=(2,10))
+
+        make_label(right, "2. Tên kịch bản (để gợi nhớ):").pack(anchor="w")
+        self.tpl_name_entry = make_entry(right)
+        self.tpl_name_entry.pack(fill="x", pady=(2,10))
+
+        make_label(right, "3. Nội dung kịch bản:").pack(anchor="w")
+        f_edit = tk.Frame(right, bg=C["input"], highlightthickness=1, highlightbackground=C["border"])
+        f_edit.pack(fill="both", expand=True, pady=(2,10))
+        self.tpl_edit = tk.Text(f_edit, font=F["body"], bg=C["input"], fg=C["text"], 
+                                insertbackground=C["text"], height=8, relief="flat", bd=5, wrap="word")
+        self.tpl_edit.pack(fill="both", expand=True)
+
+        make_label(right, "4. Ảnh đính kèm cho kịch bản:").pack(anchor="w")
+        self.tpl_image_path = tk.StringVar(value="")
+        lbl_img = tk.Label(right, textvariable=self.tpl_image_path, font=F["sm"], bg=C["card"], fg=C["accent"], wraplength=350)
+        lbl_img.pack(fill="x")
+        
+        f_img = tk.Frame(right, bg=C["card"])
+        f_img.pack(fill="x", pady=5)
+        Btn(f_img, "🖼️ Chọn ảnh", cmd=self._pick_tpl_image, color="#4b5563").pack(side="left", expand=True, fill="x", padx=(0,2))
+        Btn(f_img, "🗑️ Xóa ảnh", cmd=self._clear_tpl_image, color=C["red"]).pack(side="left", expand=True, fill="x", padx=(2,0))
+
+        Btn(right, "💾 LƯU KỊCH BẢN", cmd=self._save_tpl_item, color=C["green"]).pack(fill="x", pady=5)
+        Btn(right, "🗑️ XÓA KỊCH BẢN CHỌN", cmd=self._delete_tpl_item, color=C["red"]).pack(fill="x", pady=5)
+        
+        tk.Label(right, text="💡 Gợi ý: Tạo ít nhất 3-5 mẫu kịch bản cho \nmỗi loại để tỷ lệ an toàn cao nhất.", 
+                 font=F["sm"], bg=C["card"], fg=C["dim"], justify="left").pack(pady=10)
+        
+        self._refresh_tpl_table()
+
+    def _on_tpl_select(self, e):
+        sel = self.tpl_tree.selection()
+        if not sel: return
+        idx = self.tpl_tree.index(sel[0])
+        t = self.templates[idx]
+        self.tpl_type_var.set(t["type"])
+        self.tpl_name_entry.delete(0, "end")
+        self.tpl_name_entry.insert(0, t.get("name", ""))
+        self.tpl_edit.delete("1.0", "end")
+        self.tpl_edit.insert("1.0", t["content"])
+        self.tpl_image_path.set(t.get("image", ""))
+
+    def _save_tpl_item(self):
+        t_type = self.tpl_type_var.get()
+        t_name = self.tpl_name_entry.get().strip()
+        t_content = self.tpl_edit.get("1.0", "end").strip()
+        t_image = self.tpl_image_path.get()
+        
+        if not t_name or not t_content:
+            messagebox.showwarning("Thiếu thông tin", "Vui lòng nhập đầy đủ Tên và Nội dung kịch bản.")
+            return
+        
+        item = {"name": t_name, "type": t_type, "content": t_content, "image": t_image}
+        
+        # Check if updating
+        sel = self.tpl_tree.selection()
+        if sel:
+            idx = self.tpl_tree.index(sel[0])
+            self.templates[idx] = item
+            self._log(f"✅ Đã cập nhật kịch bản '{t_name}'", "ok")
+        else:
+            self.templates.append(item)
+            self._log(f"✅ Đã thêm kịch bản '{t_name}'", "ok")
+            
+        self._save_templates()
+        self._refresh_tpl_table()
+        self._refresh_action_combos() # Đồng bộ sang tab Vận hành
+        self._clear_tpl_editor() # Clear form sau khi lưu
+        self.tpl_name_entry.delete(0, "end")
+        self.tpl_edit.delete("1.0", "end")
+        self.tpl_image_path.set("")
+
+    def _pick_tpl_image(self):
+        fp = filedialog.askopenfilename(filetypes=[("Image Files", "*.png;*.jpg;*.jpeg;*.gif;*.bmp")])
+        if fp:
+            try:
+                original_path = Path(fp)
+                new_fn = f"tpl_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{original_path.name}"
+                dest_path = IMAGE_DIR / new_fn
+                shutil.copy2(fp, dest_path)
+                self.tpl_image_path.set(str(dest_path.absolute()))
+                self._log(f"🖼️ Đã gán ảnh cho kịch bản: {new_fn}", "ok")
+            except Exception as e:
+                self._log(f"❌ Lỗi gán ảnh: {e}", "error")
+
+    def _clear_tpl_image(self):
+        self.tpl_image_path.set("")
+
+    def _delete_tpl_item(self):
+        sel = self.tpl_tree.selection()
+        if not sel: return
+        idx = self.tpl_tree.index(sel[0])
+        if messagebox.askyesno("Xác nhận", "Xóa kịch bản này?"):
+            self.templates.pop(idx)
+            self._save_templates()
+            self._refresh_tpl_table()
+            self._refresh_action_combos()
+            self.tpl_edit.delete("1.0", "end")
+            self._log(f"🗑️ Đã xóa kịch bản khỏi thư viện", "warn")
+
+    def _refresh_action_combos(self):
+        """Cập nhật dropdown ở Tab Vận hành - Đồng bộ ngay khi Thêm/Sửa/Xóa"""
+        f_tpls = [t.get("name", "Không tên") for t in self.templates if t["type"] == "Kết bạn"]
+        i_tpls = [t.get("name", "Không tên") for t in self.templates if t["type"] == "Mời nhóm"]
+        m_tpls = [t.get("name", "Không tên") for t in self.templates if t["type"] == "Nhắn tin"]
+
+        # Cập nhật Tab Vận hành: Kết bạn
+        self.tpl_friend_combo["values"] = f_tpls
+        curr_f = self.tpl_friend_sel.get()
+        if not f_tpls:
+            self.tpl_friend_sel.set("")
+        elif not curr_f or curr_f not in f_tpls:
+            self.tpl_friend_sel.set(f_tpls[0])
+
+        # Cập nhật Tab Vận hành: Mời nhóm
+        self.tpl_invite_combo["values"] = i_tpls
+        curr_i = self.tpl_invite_sel.get()
+        if not i_tpls:
+            self.tpl_invite_sel.set("")
+        elif not curr_i or curr_i not in i_tpls:
+            self.tpl_invite_sel.set(i_tpls[0])
+
+        # Cập nhật Tab Vận hành: Nhắn tin
+        self.tpl_msg_combo["values"] = m_tpls
+        curr_m = self.tpl_msg_sel.get()
+        if not m_tpls:
+            self.tpl_msg_sel.set("")
+        elif not curr_m or curr_m not in m_tpls:
+            self.tpl_msg_sel.set(m_tpls[0])
+
+    def _refresh_tpl_table(self):
+        self.tpl_tree.delete(*self.tpl_tree.get_children())
+        for t in self.templates:
+            content_preview = t["content"].replace("\n", " ")[:50] + "..."
+            self.tpl_tree.insert("", "end", values=(t.get("name","?"), t["type"], content_preview))
 
     def on_close(self):
         if self.bridge: self.bridge.stop()
