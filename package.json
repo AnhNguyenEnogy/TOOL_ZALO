@@ -9,6 +9,7 @@
     "start": "node scanner.mjs"
   },
   "dependencies": {
+    "image-size": "^2.0.2",
     "zca-js": "^2.1.2"
   }
 }

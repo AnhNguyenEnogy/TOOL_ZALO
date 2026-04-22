@@ -33,7 +33,16 @@ try:
 except ImportError:
     HAS_PILLOW = False
 
-BASE_DIR = Path(__file__).parent
+if getattr(sys, 'frozen', False):
+    # If running as an executable
+    BASE_DIR = Path(sys.executable).parent
+    BUNDLE_DIR = Path(sys._MEIPASS)
+else:
+    # If running as a script
+    BASE_DIR = Path(__file__).parent
+    BUNDLE_DIR = Path(__file__).parent
+
+# Data files (next to the .exe)
 CREDENTIALS_FILE = BASE_DIR / "credentials.json"
 EXCEL_DATA_DIR = BASE_DIR / "excel_data"
 EXCEL_DATA_DIR.mkdir(exist_ok=True)
@@ -87,10 +96,12 @@ class ZaloBridge:
                 [self.node_path, self.bridge_path],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, encoding="utf-8", bufsize=1,
+                cwd=str(BASE_DIR),
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
             self.running = True
             threading.Thread(target=self._read, daemon=True).start()
+            threading.Thread(target=self._read_err, daemon=True).start()
             return True
         except Exception as e:
             print(f"[Bridge] {e}")
@@ -123,8 +134,23 @@ class ZaloBridge:
                 elif self.on_event:
                     # Global events or status
                     self.on_event(mid, data)
-            except json.JSONDecodeError: continue
-            except: break
+            except json.JSONDecodeError:
+                if line: print(f"[Bridge Raw] {line}")
+                continue
+            except Exception as e:
+                print(f"[Bridge Read Error] {e}")
+                break
+
+    def _read_err(self):
+        while self.running and self.proc and self.proc.poll() is None:
+            try:
+                line = self.proc.stderr.readline().strip()
+                if line:
+                    print(f"[Bridge ERR] {line}")
+                    if self.on_event:
+                        self.on_event(None, {"action": "debug", "info": f"⚠️ {line}"})
+            except:
+                break
 
     def send(self, action, params=None, callback=None):
         if not self.proc or self.proc.poll() is not None:
@@ -219,7 +245,7 @@ class App:
         self.filter_admin = tk.BooleanVar(value=True)
         self.accounts = self._load_accounts()
         self.current_account = None
-        self.batch_running = False
+        self.batch_running = set()  # Track running accounts by name
         self.image_path = tk.StringVar(value="Chưa chọn ảnh...")
         self.use_random = tk.BooleanVar(value=True)
         self.scan_history = self._load_scan_history()
@@ -236,8 +262,14 @@ class App:
 
     # ---- Node.js ----
     def _find_node(self):
-        p = BASE_DIR / "nodejs_portable" / "node-v20.12.2-win-x64" / "node.exe"
-        if p.exists(): return str(p)
+        # 1. Check next to .exe (External Portable)
+        p1 = BASE_DIR / "nodejs_portable" / "node-v20.12.2-win-x64" / "node.exe"
+        if p1.exists(): return str(p1)
+        
+        # 2. Check bundled (if we decide to bundle it)
+        p2 = BUNDLE_DIR / "nodejs_portable" / "node-v20.12.2-win-x64" / "node.exe"
+        if p2.exists(): return str(p2)
+
         import shutil
         return shutil.which("node")
 
@@ -346,6 +378,8 @@ class App:
                 cell = ws.cell(row=rid, column=col)
                 cell.border = border
                 cell.alignment = Alignment(vertical="center", horizontal="center" if col in [1,2,7,8,9] else "left")
+                if col == 3: # Zalo ID column
+                    cell.number_format = "@" # Force Text format to prevent rounding
 
         # Column widths
         ws.column_dimensions["A"].width = 6
@@ -373,6 +407,15 @@ class App:
 
     def _save_last_session(self):
         """Lưu toàn bộ thông số và data phiên làm việc"""
+        self._save_session_json()
+        # Đồng bộ luôn vào file Excel hiện tại nếu có
+        try:
+            if self.current_data_file and self.current_data_file.exists() and self.scan_result:
+                self._save_scan_data(self.scan_result)
+        except: pass
+
+    def _save_session_json(self):
+        """Lưu nhanh trạng thái vào JSON (không ghi Excel, dùng trong batch progress)"""
         try:
             data = {
                 "link": self.link_entry.get().strip(),
@@ -383,12 +426,6 @@ class App:
                 "scan_result": self.scan_result
             }
             LAST_SESSION_FILE.write_text(json.dumps(data, ensure_ascii=False), "utf-8")
-            
-            # Đồng bộ luôn vào file Excel hiện tại nếu có
-            if self.current_data_file and self.current_data_file.exists() and self.scan_result:
-                # Với Excel, ta sẽ ghi đè toàn bộ hoặc cập nhật status. 
-                # Để đảm bảo đồng bộ, ta gọi lại hàm save Excel
-                self._save_scan_data(self.scan_result)
         except: pass
 
     def _load_last_session(self):
@@ -657,6 +694,18 @@ class App:
         Btn(r1, "📨 Mời nhóm", cmd=self._batch_invite, color=C["orange"]).pack(side="left", expand=True, fill="x", padx=(3,0))
 
         Btn(card, "💥 GỬI TIN NHẮN (Marketing)", cmd=self._batch_message, color=C["green"]).pack(fill="x", pady=(2,2))
+        
+        # --- COMBO MODE ---
+        combo_frame = tk.Frame(card, bg=C["card"])
+        combo_frame.pack(fill="x", pady=(2,2))
+        Btn(combo_frame, "🔥 COMBO (Kết bạn + Nhắn tin)", cmd=self._batch_combo, color="#9333ea").pack(side="left", expand=True, fill="x", padx=(0,3))
+        lf = tk.Frame(combo_frame, bg=C["card"])
+        lf.pack(side="left")
+        tk.Label(lf, text="Max KB:", font=F["sm"], bg=C["card"], fg=C["dim"]).pack(side="left")
+        self.combo_friend_limit = make_entry(lf, width=5)
+        self.combo_friend_limit.insert(0, "50")
+        self.combo_friend_limit.pack(side="left", padx=(2,0))
+        
         self.stop_btn = Btn(card, "⛔ DỪNG", cmd=self._do_cancel, color=C["red"])
         self.stop_btn.pack(fill="x", pady=(2,0))
 
@@ -672,8 +721,20 @@ class App:
                                           state="readonly", font=F["mono"])
         self.history_combo.pack(fill="x", pady=(2,2))
         self._refresh_history()
-        Btn(card, "📗 Load Excel đã lưu", cmd=self._load_history_item,
-            color="#374151").pack(fill="x", pady=(2,0))
+        row_h = tk.Frame(card, bg=C["card"])
+        row_h.pack(fill="x")
+        Btn(row_h, "📗 Load Excel", cmd=self._load_history_item, color="#374151"
+            ).pack(side="left", expand=True, fill="x", padx=(0,2))
+        Btn(row_h, "🧹 Xóa ✅", cmd=self._clear_sent_status, color="#374151"
+            ).pack(side="left", expand=True, fill="x", padx=(2,0))
+
+    def _clear_sent_status(self):
+        if not self.scan_result or not messagebox.askyesno("Xác nhận", "Xóa toàn bộ đánh dấu ✅ đang hiện?"):
+            return
+        for m in self.scan_result.get("members", []):
+            m["friend_sent"] = m["invite_sent"] = m["message_sent"] = False
+        self._apply_filter()
+        self._log("🧹 Đã xóa toàn bộ đánh dấu trạng thái trên bảng.", "info")
 
     # ---- STATS ----
     def _build_stats(self, parent):
@@ -720,7 +781,18 @@ class App:
         
         sel_row = tk.Frame(hdr, bg=C["card2"])
         sel_row.pack(side="right")
+        
+        # Range selection inputs
+        tk.Label(sel_row, text="Từ:", font=F["sm"], bg=C["card2"], fg=C["dim"]).pack(side="left", padx=(0,2))
+        self.range_from = make_entry(sel_row, width=5)
+        self.range_from.pack(side="left", padx=(0,3))
+        tk.Label(sel_row, text="→", font=F["sm"], bg=C["card2"], fg=C["dim"]).pack(side="left", padx=(0,2))
+        self.range_to = make_entry(sel_row, width=5)
+        self.range_to.pack(side="left", padx=(0,3))
+        Btn(sel_row, "🔢 Chọn dải", cmd=self._toggle_range, color="#7c3aed", font=F["sm"]).pack(side="left", padx=(0,8))
+        
         Btn(sel_row, "✅ Tất cả", cmd=lambda: self._toggle_all(True), color=C["accent"], font=F["sm"]).pack(side="left", padx=5)
+        Btn(sel_row, "🟦 Chọn bôi đen", cmd=lambda: self._toggle_selected(True), color="#2563eb", font=F["sm"]).pack(side="left", padx=5)
         Btn(sel_row, "⬜ Bỏ chọn", cmd=lambda: self._toggle_all(False), color="#374151", font=F["sm"]).pack(side="left")
 
         tc = tk.Frame(tbl_f, bg=C["card"])
@@ -782,7 +854,7 @@ class App:
         if not self.node_path:
             self.login_status.config(text="❌ Node.js not found!", fg=C["red"])
             return
-        bp = str(BASE_DIR / "zalo_bridge.mjs")
+        bp = str(BUNDLE_DIR / "zalo_bridge.mjs")
         self.bridge = ZaloBridge(self.node_path, bp, on_event=lambda e,d: self.root.after(0, self._evt, e, d))
         if self.bridge.start():
             self._log("Bridge khởi động...")
@@ -795,109 +867,107 @@ class App:
             self._log("Hệ thống Bridge đã hoạt động.", "ok")
             if self.accounts:
                 self.root.after(300, self._do_login)
+        elif isinstance(d, dict) and d.get("action") == "debug":
+            self._log(f"ℹ️ Bridge: {d.get('info', '')}", "info")
         elif eid == "scan_progress":
             fetched = d.get('fetched', 0)
             self.plabel.config(text=f"Đang quét trang {d.get('page')}... ({fetched} mems)")
-            # Indeterminate progress or based on a guess
             self.pvar.set((self.pvar.get() + 5) % 100)
 
     def _batch_progress_handler(self, d, err, acc_name, act):
         if err:
-            self.root.after(0, self._log, f"❌ Lỗi {act}: {err}", "error", acc_name)
+            self._log(f"❌ Lỗi {act}: {err}", "error", acc_name)
             return
         if not d: return
         
-        # Check message type: progress (has 'current'), debug (has 'action' but no 'current'), or final (has 'success')
         if "current" in d:
-            target_id = str(d.get("uid") or "")
+            uid = str(d.get("uid") or "")
             ok = d.get("ok", False)
             curr = d.get("current", 0)
             total = d.get("total", 0)
+            method = d.get("method", "")
             
-            # Chỉ cập nhật trạng thái "đã gửi" khi THÀNH CÔNG
             members = self.scan_result.get("members", [])
-            found_member = None
-            for m in members:
-                if str(m.get("id")) == target_id:
-                    if ok:  # CHỈ đánh dấu khi thực sự thành công
-                        if act == "Kết bạn": m["friend_sent"] = True
-                        elif act == "Mời nhóm": m["invite_sent"] = True
-                        elif act == "Nhắn tin": m["message_sent"] = True
-                    found_member = m
-                    break
-            
-            # Cập nhật UI ngay lập tức cho dòng đó
-            if found_member:
-                for item_id in self.tree.get_children():
-                    if str(self.tree.item(item_id, "values")[2]) == target_id:
-                        f_stat = "✅" if found_member.get("friend_sent") else ""
-                        i_stat = "✅" if found_member.get("invite_sent") else ""
-                        m_stat = "✅" if found_member.get("message_sent") else ""
-                        
-                        old_vals = list(self.tree.item(item_id, "values"))
-                        old_vals[5] = f_stat
-                        old_vals[6] = i_stat
-                        old_vals[7] = m_stat
-                        tag = "ok" if ok else "error"
-                        self.tree.item(item_id, values=old_vals, tags=(tag,))
-                        break
-            
-            # Tự động lưu vào Excel để bảo toàn dữ liệu
+            m = next((m for m in members if str(m.get("id")) == uid), None)
+            display = f"{uid} ({m.get('dName') or '?'})" if m else uid
+
+            if ok and m:
+                if act == "Kết bạn":
+                    m["friend_sent"] = True
+                    self._log(f"✅ Đã gửi lời mời Kết bạn: {display} ({curr}/{total})", "ok", acc_name)
+                elif act == "Mời nhóm":
+                    m["invite_sent"] = True
+                    self._log(f"✅ Đã mời vào nhóm: {display} ({curr}/{total})", "ok", acc_name)
+                elif act == "Nhắn tin":
+                    m["message_sent"] = True
+                    if method == "friendRequest+msg":
+                        m["friend_sent"] = True
+                        self._log(f"✅ Đã gửi Kết bạn + Tin nhắn: {display} ({curr}/{total})", "ok", acc_name)
+                    else:
+                        self._log(f"✅ Đã gửi Tin nhắn: {display} ({curr}/{total})", "ok", acc_name)
+                elif act == "Combo":
+                    if method == "sendMessage":
+                        # Đã là bạn → gửi tin nhắn trực tiếp OK
+                        m["friend_sent"] = True
+                        m["message_sent"] = True
+                        self._log(f"✅ Combo (Gửi tin - đã bạn bè): {display} ({curr}/{total})", "ok", acc_name)
+                    elif method == "friendRequest+sendMessage":
+                        # Kết bạn + Gửi tin nhắn riêng → cả 2 thành công
+                        m["friend_sent"] = True
+                        m["message_sent"] = True
+                        self._log(f"✅ Combo (Kết bạn ✓ + Tin nhắn ✓): {display} ({curr}/{total})", "ok", acc_name)
+                    elif method == "friendRequest":
+                        # Kết bạn OK nhưng tin nhắn chưa gửi được (chờ accept)
+                        m["friend_sent"] = True
+                        self._log(f"✅ Combo (Kết bạn ✓ | Tin nhắn chờ accept): {display} ({curr}/{total})", "ok", acc_name)
+                    else:
+                        m["message_sent"] = True
+                        self._log(f"✅ Combo: {display} ({curr}/{total})", "ok", acc_name)
+            else:
+                self._log(f"❌ {act} thất bại: {display} | Lỗi: {d.get('error','?')}", "warn", acc_name)
+
+            self.action_progress.config(text=f"{act}: {curr}/{total}")
+            self.root.after(0, self._update_row_status, uid, act, ok, method)
             if ok:
                 self._save_scan_data(auto=True)
+                # Lưu JSON mỗi 3 lần thành công để tránh mất dữ liệu nếu đóng app
+                if curr % 3 == 0:
+                    self._save_session_json()
             
-            # Log with Account Name
-            if ok:
-                self._log(f"✅ {act} {target_id} ({curr}/{total})", "ok", acc_name)
-            else:
-                self._log(f"❌ {act} {target_id} lỗi: {d.get('error','?')}", "warn", acc_name)
-            
-            # Update progress label
-            self.action_progress.config(text=f"{act}: {curr}/{total}")
-            
-            # Update Table View
-            self.root.after(0, self._update_row_status, target_id, act, ok)
         elif "action" in d and "current" not in d:
-            # Debug/info message from bridge (e.g. invite_debug) - just log, don't say "done"
-            self._log(f"ℹ️ {act}: {d}", "info", acc_name)
+            self._log(f"ℹ️ {act}: {d.get('info', d)}", "info", acc_name)
         elif "success" in d:
-            # Final result from the batch
-            ok_count = d.get("successCount", 0)
-            fail_count = d.get("failCount", 0)
-            self._log(f"🏁 Xong {act} tài khoản {acc_name}: ✅{ok_count} ❌{fail_count}", "ok", acc_name)
+            self.batch_running.discard(acc_name)
+            self._log(f"🏁 Hoàn thành {act} {acc_name}: ✅{d.get('successCount',0)} ❌{d.get('failCount',0)}", "ok", acc_name)
             self.action_progress.config(text=f"Hoàn thành {act}")
             self._save_last_session()
         else:
             # Unknown format, log it
             self._log(f"🏁 Xong {act} tài khoản {acc_name}", "ok", acc_name)
 
-    def _update_row_status(self, uid, act, ok):
+    def _update_row_status(self, uid, act, ok, method=""):
         if not self.scan_result: return
-        mems = self.scan_result.get("members", [])
-        
-        # Mapping hành động sang cột và thuộc tính
-        # Index: 5:Kết bạn, 6:Mời nhóm, 7:Nhắn tin
-        action_map = {
-            "Kết bạn": {"idx": 5, "attr": "friend_sent"},
-            "Mời nhóm": {"idx": 6, "attr": "invite_sent"},
-            "Nhắn tin": {"idx": 7, "attr": "message_sent"}
-        }
-        
-        cfg = action_map.get(act)
-        if not cfg: return
+        members = self.scan_result.get("members", [])
+        m = next((m for m in members if str(m.get("id")) == str(uid)), None)
+        if not m: return
 
-        # Update bộ nhớ
-        for m in mems:
-            if str(m.get("id")) == str(uid):
-                if ok: m[cfg["attr"]] = True
-                break
-
-        # Update Treeview
+        # Update Treeview rows
         for item_id in self.tree.get_children():
             vals = list(self.tree.item(item_id, "values"))
             if str(vals[2]) == str(uid):
-                vals[cfg["idx"]] = "✅" if ok else "❌"
-                vals[8] = "Thành công" if ok else "Lỗi"
+                if ok:
+                    if act == "Kết bạn": vals[5] = "✅"
+                    elif act == "Mời nhóm": vals[6] = "✅"
+                    elif act == "Nhắn tin":
+                        vals[7] = "✅"
+                        if method == "friendRequest+msg": vals[5] = "✅"
+                    elif act == "Combo":
+                        vals[5] = "✅"  # Kết bạn luôn thành công trong combo
+                        if method in ("sendMessage", "friendRequest+sendMessage"):
+                            vals[7] = "✅"  # Tin nhắn cũng thành công
+                else:
+                    vals[8] = "Lỗi"
+                
                 self.tree.item(item_id, values=vals, tags=("ok" if ok else "error"))
                 break
 
@@ -965,12 +1035,30 @@ class App:
         self.plabel.config(text="✅ Đã quét xong!")
         
         try:
+            # Merge progress from old result if exists (Strict matching)
+            if self.scan_result and self.scan_result.get("members"):
+                old_mems = {str(m.get("id")): m for m in self.scan_result["members"]}
+                
+                for new_m in data.get("members", []):
+                    nid = str(new_m.get("id"))
+                    # Skip merging if ID is clearly corrupted/rounded (ends with 000)
+                    if nid.endswith("000"): continue
+                    
+                    found = old_mems.get(nid)
+                    if found:
+                        new_m["friend_sent"] = found.get("friend_sent", False)
+                        new_m["invite_sent"] = found.get("invite_sent", False)
+                        new_m["message_sent"] = found.get("message_sent", False)
+            
+            self.scan_result = data
             fp = self._save_scan_data(data)
             self._log(f"📂 Quét & Gộp xong: {len(self.scan_result['members'])} mms", "ok", acc_name)
             self._apply_filter()
             self._save_last_session()
         except Exception as e:
             self._log(f"Lỗi lưu data: {e}", "warn")
+            import traceback
+            traceback.print_exc()
 
     def _refresh_history(self):
         self.scan_history = self._load_scan_history()
@@ -1040,7 +1128,7 @@ class App:
         if self.bridge:
             self.bridge.send("cancel")
             self._log("⛔ Đang yêu cầu dừng...", "warn")
-            self.batch_running = False
+            self.batch_running.clear()
 
     # ============================================================
     # FILTER
@@ -1187,6 +1275,85 @@ class App:
         self._log(f"💾 Excel: {fp}", "ok")
         messagebox.showinfo("✅", f"Đã xuất {len(self.filtered)} thành viên!\n{fp}")
 
+    def _update_stats(self):
+        if not self.scan_result: return
+        mems = self.scan_result.get("members", [])
+        total = len(mems)
+        admins = len([m for m in mems if str(m.get("role")).lower() in ["admin", "owner"]])
+        # Chosen/Mems count
+        chosen = len([m for m in mems if m.get("choice")])
+        self.s_total.config(text=str(total))
+        self.s_admin.config(text=str(admins))
+        self.s_member.config(text=str(chosen))
+
+    def _toggle_all(self, state):
+        mark = "☑" if state else "☐"
+        for item_id in self.tree.get_children():
+            vals = list(self.tree.item(item_id, "values"))
+            vals[0] = mark
+            self.tree.item(item_id, values=vals)
+        
+        if self.scan_result:
+            for m in self.scan_result.get("members", []):
+                m["choice"] = state
+        self._update_stats()
+
+    def _toggle_selected(self, state):
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showinfo("Thông báo", "Vui lòng bôi đen (chọn) các dòng trong bảng trước!")
+            return
+            
+        mark = "☑" if state else "☐"
+        for item_id in selected:
+            vals = list(self.tree.item(item_id, "values"))
+            uid = str(vals[2])
+            vals[0] = mark
+            self.tree.item(item_id, values=vals)
+            
+            # Update scan_result memory
+            if self.scan_result:
+                for m in self.scan_result.get("members", []):
+                    if str(m.get("id")) == uid:
+                        m["choice"] = state
+                        break
+        self._update_stats()
+
+    def _toggle_range(self):
+        """Chọn dải STT: tích chọn từ STT bắt đầu đến STT kết thúc, bỏ chọn tất cả ngoài dải."""
+        try:
+            r_from = int(self.range_from.get().strip())
+            r_to = int(self.range_to.get().strip())
+        except ValueError:
+            messagebox.showwarning("Lỗi", "Vui lòng nhập số hợp lệ cho dải chọn (Từ / Đến).")
+            return
+        
+        if r_from > r_to:
+            r_from, r_to = r_to, r_from  # Tự đảo nếu nhập ngược
+        
+        count = 0
+        for item_id in self.tree.get_children():
+            vals = list(self.tree.item(item_id, "values"))
+            stt = int(vals[1])
+            uid = str(vals[2])
+            
+            if r_from <= stt <= r_to:
+                vals[0] = "☑"
+                count += 1
+            else:
+                vals[0] = "☐"
+            self.tree.item(item_id, values=vals)
+            
+            # Cập nhật scan_result memory
+            if self.scan_result:
+                for m in self.scan_result.get("members", []):
+                    if str(m.get("id")) == uid:
+                        m["checked"] = (r_from <= stt <= r_to)
+                        break
+        
+        self._log(f"🔢 Đã chọn dải STT {r_from} → {r_to}: {count} người", "info")
+        self._update_stats()
+
     def _import_excel(self):
         if not HAS_OPENPYXL:
             messagebox.showerror("!", "Cần cài openpyxl để load Excel.")
@@ -1217,12 +1384,6 @@ class App:
                 ids.append(vals[2])
         return ids
 
-    def _toggle_all(self, state):
-        mark = "☑" if state else "☐"
-        for item_id in self.tree.get_children():
-            vals = list(self.tree.item(item_id, "values"))
-            vals[0] = mark
-            self.tree.item(item_id, values=vals)
 
     def _on_tree_click(self, event):
         region = self.tree.identify("region", event.x, event.y)
@@ -1252,20 +1413,42 @@ class App:
         acc = self._get_current_acc()
         if not acc or not ids: return None, None
         
+        # Tên hành động bằng tiếng Việt
+        act_label = {"friend": "Kết bạn", "invite": "Mời nhóm", "message": "Nhắn tin"}.get(action_type, "")
+        
         # Lọc bỏ những người đã được xử lý thành công trước đó
-        m_map = {m["id"]: m for m in self.filtered}
+        # ĐỌC TỪ scan_result["members"] (source of truth) thay vì self.filtered (bản copy cũ)
+        members = self.scan_result.get("members", []) if self.scan_result else []
+        m_map = {str(m.get("id","")): m for m in members}
+        
+        # Fallback: nếu không tìm thấy trong members, thử filtered
+        for fm in self.filtered:
+            fid = str(fm.get("id",""))
+            if fid not in m_map:
+                m_map[fid] = fm
+        
         final_ids = []
+        skipped_ids = []
         
         for uid in ids:
             m = m_map.get(str(uid), {})
-            if action_type == "friend" and m.get("friend_sent"): continue
-            if action_type == "invite" and m.get("invite_sent"): continue
-            if action_type == "message" and m.get("message_sent"): continue
-            final_ids.append(str(uid)) # Buộc phải là string để tránh lỗi Bridge làm tròn số
+            if action_type == "friend" and m.get("friend_sent"):
+                skipped_ids.append(str(uid)); continue
+            if action_type == "invite" and m.get("invite_sent"):
+                skipped_ids.append(str(uid)); continue
+            if action_type == "message" and m.get("message_sent"):
+                skipped_ids.append(str(uid)); continue
+            final_ids.append(str(uid))
+        
+        # Log rõ ràng số bỏ qua
+        if skipped_ids:
+            self._log(f"⏭️ {act_label}: Bỏ qua {len(skipped_ids)}/{len(ids)} người đã xử lý trước đó", "warn")
             
         if not final_ids:
-            messagebox.showinfo("Thông báo", "Tất cả những người được chọn đã được xử lý trước đó!")
+            messagebox.showinfo("Thông báo", f"Tất cả {len(ids)} người đã được {act_label} trước đó!\nKhông cần gửi lại.")
             return None, None
+        
+        self._log(f"📋 {act_label}: Sẽ gửi {len(final_ids)} người (bỏ qua {len(skipped_ids)} đã xong)", "info")
             
         # Kiểm tra nhanh nếu thấy ID có dấu hiệu bị lỗi làm tròn (kết thúc bằng 000)
         if any(str(uid).endswith("000") for uid in final_ids):
@@ -1281,6 +1464,10 @@ class App:
     def _batch_friend(self):
         actual_ids, acc = self._get_ids_for_action("friend")
         if not actual_ids: return
+        if acc['name'] in self.batch_running:
+            self._log(f"⚠️ Tài khoản {acc['name']} đang chạy tác vụ khác, vui lòng đợi!", "warn")
+            return
+        self.batch_running.add(acc['name'])
         
         delay = self._get_delay()
         gid = self.scan_result.get("groupInfo",{}).get("groupId","") if self.scan_result else ""
@@ -1310,6 +1497,10 @@ class App:
         if not actual_ids: return
         gid = self.group_id_entry.get().strip()
         if not gid: return messagebox.showwarning("!", "Nhập ID hoặc Link nhóm!")
+        if acc['name'] in self.batch_running:
+            self._log(f"⚠️ Tài khoản {acc['name']} đang chạy tác vụ khác, vui lòng đợi!", "warn")
+            return
+        self.batch_running.add(acc['name'])
         delay = self._get_delay()
         limit = self._get_limit()
 
@@ -1326,6 +1517,10 @@ class App:
     def _batch_message(self):
         actual_ids, acc = self._get_ids_for_action("message")
         if not actual_ids: return
+        if acc['name'] in self.batch_running:
+            self._log(f"⚠️ Tài khoản {acc['name']} đang chạy tác vụ khác, vui lòng đợi!", "warn")
+            return
+        self.batch_running.add(acc['name'])
         
         limit = self._get_limit()
         delay = self._get_delay()
@@ -1363,6 +1558,84 @@ class App:
             self.bridge.send("batch_send_msg", {
                 "userIds": actual_ids, "message": msg, "imagePath": img if img else None,
                 "delayMs": delay, "limit": limit, "sourceGroupId": gid,
+                "imei": acc['imei'], "cookie": acc['cookie']
+            }, cb)
+
+        threading.Thread(target=run_thread, daemon=True).start()
+
+    def _batch_combo(self):
+        """COMBO: Kết bạn RIÊNG + Gửi tin nhắn RIÊNG.
+        Flow cho mỗi người:
+        - Nếu đã là bạn → gửi tin nhắn trực tiếp
+        - Nếu người lạ → Kết bạn trước, đợi 2s, rồi gửi tin nhắn riêng
+        """
+        # Lọc những người chưa nhắn tin (combo skip nếu đã message_sent)
+        actual_ids, acc = self._get_ids_for_action("message")
+        if not actual_ids: return
+        if acc['name'] in self.batch_running:
+            self._log(f"⚠️ Tài khoản {acc['name']} đang chạy tác vụ khác, vui lòng đợi!", "warn")
+            return
+        self.batch_running.add(acc['name'])
+        
+        limit = self._get_limit()
+        delay = self._get_delay()
+        
+        # Giới hạn kết bạn cho combo
+        try:
+            friend_limit = max(0, int(self.combo_friend_limit.get().strip()))
+        except:
+            friend_limit = 50
+        
+        use_rand = self.use_random.get()
+        sel_tpl_msg = self.tpl_msg_sel.get()
+        sel_tpl_friend = self.tpl_friend_sel.get()
+        tpls = self.templates.copy()
+
+        def run_thread():
+            # Lấy nội dung tin nhắn marketing (từ kịch bản Nhắn tin)
+            msg = "Chào bạn!"
+            img = ""
+            if use_rand:
+                m_tpls = [t for t in tpls if t["type"] == "Nhắn tin"]
+                if m_tpls:
+                    chosen = random.choice(m_tpls)
+                    msg = chosen["content"]
+                    img = chosen.get("image", "")
+            else:
+                for t in tpls:
+                    if t.get("name") == sel_tpl_msg:
+                        msg = t["content"]
+                        img = t.get("image", "")
+                        break
+            
+            # Lấy nội dung lời mời kết bạn (từ kịch bản Kết bạn)
+            friend_msg = "Xin chào!"
+            if use_rand:
+                f_tpls = [t for t in tpls if t["type"] == "Kết bạn"]
+                if f_tpls:
+                    friend_msg = random.choice(f_tpls)["content"]
+            else:
+                for t in tpls:
+                    if t.get("name") == sel_tpl_friend:
+                        friend_msg = t["content"]
+                        break
+            
+            gid = self.scan_result.get("groupInfo", {}).get("groupId", "") if self.scan_result else ""
+            
+            self._log(f"🔥 COMBO: {len(actual_ids)} người | Max kết bạn: {friend_limit} (Acc:{acc['name']})", "info", acc['name'])
+            self._log(f"📝 Lời kết bạn: '{friend_msg[:40]}...'", "info", acc['name'])
+            self._log(f"📝 Tin nhắn: '{msg[:40]}...' | Ảnh: '{img or 'không'}'", "info", acc['name'])
+            
+            def cb(d, e):
+                self.root.after(0, self._batch_progress_handler, d, e, acc['name'], "Combo")
+            
+            self.bridge.send("batch_combo", {
+                "userIds": actual_ids, 
+                "message": msg,              # Tin nhắn marketing
+                "friendMessage": friend_msg,  # Lời chào kết bạn (riêng)
+                "imagePath": img if img else None,
+                "delayMs": delay, "limit": limit, "friendLimit": friend_limit,
+                "sourceGroupId": gid,
                 "imei": acc['imei'], "cookie": acc['cookie']
             }, cb)
 
@@ -1489,9 +1762,6 @@ class App:
         self._refresh_tpl_table()
         self._refresh_action_combos() # Đồng bộ sang tab Vận hành
         self._clear_tpl_editor() # Clear form sau khi lưu
-        self.tpl_name_entry.delete(0, "end")
-        self.tpl_edit.delete("1.0", "end")
-        self.tpl_image_path.set("")
 
     def _pick_tpl_image(self):
         fp = filedialog.askopenfilename(filetypes=[("Image Files", "*.png;*.jpg;*.jpeg;*.gif;*.bmp")])
@@ -1508,6 +1778,13 @@ class App:
 
     def _clear_tpl_image(self):
         self.tpl_image_path.set("")
+
+    def _clear_tpl_editor(self):
+        """Xóa trắng toàn bộ form nhập liệu kịch bản"""
+        self.tpl_name_entry.delete(0, "end")
+        self.tpl_edit.delete("1.0", "end")
+        self.tpl_image_path.set("")
+        self.tpl_tree.selection_remove(self.tpl_tree.selection())
 
     def _delete_tpl_item(self):
         sel = self.tpl_tree.selection()
