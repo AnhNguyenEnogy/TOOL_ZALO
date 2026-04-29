@@ -50,6 +50,7 @@ AVATAR_CACHE_DIR = BASE_DIR / "avatar_cache"
 AVATAR_CACHE_DIR.mkdir(exist_ok=True)
 LAST_SESSION_FILE = BASE_DIR / "last_session.json"
 TEMPLATES_FILE = BASE_DIR / "templates.json"
+BLACKLIST_FILE = BASE_DIR / "blacklist.json"
 IMAGE_DIR = BASE_DIR / "anh_ket_ban_nhan_tin"
 IMAGE_DIR.mkdir(exist_ok=True)
 
@@ -250,6 +251,7 @@ class App:
         self.use_random = tk.BooleanVar(value=True)
         self.scan_history = self._load_scan_history()
         self.templates = self._load_templates()
+        self.blacklist = self._load_blacklist()
         self.current_data_file = None # Theo dõi file JSON hiện tại để lưu đè status
 
         EXCEL_DATA_DIR.mkdir(exist_ok=True)
@@ -498,6 +500,11 @@ class App:
         self.tab_tpl = tk.Frame(self.nb, bg=C["bg"])
         self.nb.add(self.tab_tpl, text=" 📜 THƯ VIỆN KỊCH BẢN ")
         self._build_template_tab(self.tab_tpl)
+
+        # TAB 3: BLACKLIST
+        self.tab_bl = tk.Frame(self.nb, bg=C["bg"])
+        self.nb.add(self.tab_bl, text=" 🚫 DANH SÁCH ĐEN ")
+        self._build_blacklist_tab(self.tab_bl)
 
     # ---- ACCOUNT SECTION ----
     def _build_account_section(self, parent):
@@ -798,15 +805,14 @@ class App:
         tc = tk.Frame(tbl_f, bg=C["card"])
         tc.pack(fill="both", expand=True, padx=1)
         
-        cols = ("check", "stt", "id", "name", "zname", "friend", "invite", "msg", "status")
+        cols = ("check", "stt", "id", "name", "friend", "invite", "msg", "status")
         self.tree = ttk.Treeview(tc, columns=cols, show="headings", style="T.Treeview", selectmode="extended")
         
         col_defs = [
             ("check", "Chon", 35, "center"),
             ("stt", "STT", 40, "center"),
             ("id", "Zalo ID", 155, "w"),
-            ("name", "Tên hiển thị", 210, "w"),
-            ("zname", "Tên Zalo", 160, "w"),
+            ("name", "Tên hiển thị", 280, "w"),
             ("friend", "Kết bạn", 80, "center"),
             ("invite", "Mời nhóm", 80, "center"),
             ("msg", "Nhắn tin", 80, "center"),
@@ -826,9 +832,12 @@ class App:
         sb.pack(side="right", fill="y")
         self.tree.configure(yscrollcommand=sb.set)
 
-        # Lower: Logs
+        # Lower: Logs (nhỏ hơn — mặc định ~20% chiều cao)
         lf = tk.Frame(self.pane, bg=C["card"], highlightbackground=C["border"], highlightthickness=1)
-        self.pane.add(lf, minsize=100)
+        self.pane.add(lf, minsize=80)
+        
+        # Set sash để bảng chiếm 80%, log chiếm 20%
+        self.root.after(200, lambda: self._set_log_ratio(0.82))
 
         tk.Frame(lf, bg=C["card2"], pady=3, padx=8).pack(fill="x")
         tk.Label(lf, text="📝 NHẬT KÝ HOẠT ĐỘNG (Có thể kéo dãn)", font=F["body"], bg=C["card2"], fg=C["dim"]).place(x=8, y=2)
@@ -846,6 +855,14 @@ class App:
         self.log.insert("end", f"[{ts}] {prefix}{msg}\n", tag)
         self.log.see("end")
         self.log.config(state="disabled")
+
+    def _set_log_ratio(self, table_ratio=0.82):
+        """Set sash position so table gets table_ratio of total height."""
+        try:
+            h = self.pane.winfo_height()
+            if h > 100:
+                self.pane.sash_place(0, 0, int(h * table_ratio))
+        except: pass
 
     # ============================================================
     # BRIDGE
@@ -907,19 +924,22 @@ class App:
                         self._log(f"✅ Đã gửi Tin nhắn: {display} ({curr}/{total})", "ok", acc_name)
                 elif act == "Combo":
                     if method == "sendMessage":
-                        # Đã là bạn → gửi tin nhắn trực tiếp OK
-                        m["friend_sent"] = True
+                        # sendMessage thành công (có thể là bạn, có thể chưa — Zalo vẫn cho gửi)
                         m["message_sent"] = True
-                        self._log(f"✅ Combo (Gửi tin - đã bạn bè): {display} ({curr}/{total})", "ok", acc_name)
+                        self._log(f"✅ Combo (Gửi tin OK): {display} ({curr}/{total})", "ok", acc_name)
                     elif method == "friendRequest+sendMessage":
                         # Kết bạn + Gửi tin nhắn riêng → cả 2 thành công
                         m["friend_sent"] = True
                         m["message_sent"] = True
                         self._log(f"✅ Combo (Kết bạn ✓ + Tin nhắn ✓): {display} ({curr}/{total})", "ok", acc_name)
                     elif method == "friendRequest":
-                        # Kết bạn OK nhưng tin nhắn chưa gửi được (chờ accept)
+                        # Kết bạn OK nhưng tin nhắn chưa gửi được
                         m["friend_sent"] = True
                         self._log(f"✅ Combo (Kết bạn ✓ | Tin nhắn chờ accept): {display} ({curr}/{total})", "ok", acc_name)
+                    elif method == "sendMessageStranger":
+                        # Hết quota kết bạn, nhắn tin qua nhóm thành công
+                        m["message_sent"] = True
+                        self._log(f"✅ Combo (Nhắn tin qua nhóm): {display} ({curr}/{total})", "ok", acc_name)
                     else:
                         m["message_sent"] = True
                         self._log(f"✅ Combo: {display} ({curr}/{total})", "ok", acc_name)
@@ -956,17 +976,22 @@ class App:
             vals = list(self.tree.item(item_id, "values"))
             if str(vals[2]) == str(uid):
                 if ok:
-                    if act == "Kết bạn": vals[5] = "✅"
-                    elif act == "Mời nhóm": vals[6] = "✅"
+                    if act == "Kết bạn": vals[4] = "✅"
+                    elif act == "Mời nhóm": vals[5] = "✅"
                     elif act == "Nhắn tin":
-                        vals[7] = "✅"
-                        if method == "friendRequest+msg": vals[5] = "✅"
+                        vals[6] = "✅"
+                        if method == "friendRequest+msg": vals[4] = "✅"
                     elif act == "Combo":
-                        vals[5] = "✅"  # Kết bạn luôn thành công trong combo
-                        if method in ("sendMessage", "friendRequest+sendMessage"):
-                            vals[7] = "✅"  # Tin nhắn cũng thành công
+                        if method == "sendMessage":
+                            vals[6] = "✅"
+                        elif method == "friendRequest+sendMessage":
+                            vals[4] = "✅"; vals[6] = "✅"
+                        elif method == "friendRequest":
+                            vals[4] = "✅"
+                        elif method == "sendMessageStranger":
+                            vals[6] = "✅"
                 else:
-                    vals[8] = "Lỗi"
+                    vals[7] = "Lỗi"
                 
                 self.tree.item(item_id, values=vals, tags=("ok" if ok else "error"))
                 break
@@ -1188,8 +1213,8 @@ class App:
             i_mark = "✅" if m["invite_sent"] else ""
             m_mark = "✅" if m["message_sent"] else ""
             
-            # vals: check, stt, id, name, zname, friend, invite, msg, status
-            vals = (check_mark, i+1, m["id"], m["dName"], m["zaloName"], f_mark, i_mark, m_mark, m["status"])
+            # vals: check, stt, id, name, friend, invite, msg, status
+            vals = (check_mark, i+1, m["id"], m["dName"], f_mark, i_mark, m_mark, m["status"])
             self.tree.insert("","end", values=vals, tags=tuple(tags))
 
         ft = "(đã lọc)" if self.filter_admin.get() else ""
@@ -1248,7 +1273,7 @@ class App:
         ws.append([])
 
         # Header
-        headers = ["STT", "Zalo ID", "Tên hiển thị", "Tên Zalo", "Vai trò", "Kết bạn", "Mời nhóm"]
+        headers = ["STT", "Zalo ID", "Tên hiển thị", "Vai trò", "Kết bạn", "Mời nhóm"]
         ws.append(headers)
         for cell in ws[6]:
             cell.font = hdr_font
@@ -1259,7 +1284,7 @@ class App:
         for i, m in enumerate(self.filtered):
             f_stat = "v" if m.get("friend_sent") else ""
             i_stat = "v" if m.get("invite_sent") else ""
-            row = [i+1, m["id"], m["dName"], m["zaloName"], m["role"], f_stat, i_stat]
+            row = [i+1, m["id"], m["dName"], m["role"], f_stat, i_stat]
             ws.append(row)
             for cell in ws[ws.max_row]:
                 cell.border = border
@@ -1267,9 +1292,9 @@ class App:
         # Column widths
         ws.column_dimensions["A"].width = 6
         ws.column_dimensions["B"].width = 22
-        ws.column_dimensions["C"].width = 28
-        ws.column_dimensions["D"].width = 24
-        ws.column_dimensions["E"].width = 16
+        ws.column_dimensions["C"].width = 30
+        ws.column_dimensions["D"].width = 16
+        ws.column_dimensions["E"].width = 10
 
         wb.save(fp)
         self._log(f"💾 Excel: {fp}", "ok")
@@ -1430,8 +1455,18 @@ class App:
         final_ids = []
         skipped_ids = []
         
+        # Build blacklist lookup (ID + tên)
+        bl_ids = set(str(b.get("id","")) for b in self.blacklist if b.get("id"))
+        bl_names = set(b.get("name","").strip().lower() for b in self.blacklist if b.get("name"))
+        blacklisted = []
+        
         for uid in ids:
             m = m_map.get(str(uid), {})
+            # Kiểm tra danh sách đen (theo ID hoặc tên)
+            dname = (m.get("dName") or "").strip().lower()
+            zname = (m.get("zaloName") or "").strip().lower()
+            if str(uid) in bl_ids or (dname and dname in bl_names) or (zname and zname in bl_names):
+                blacklisted.append(str(uid)); continue
             if action_type == "friend" and m.get("friend_sent"):
                 skipped_ids.append(str(uid)); continue
             if action_type == "invite" and m.get("invite_sent"):
@@ -1439,6 +1474,9 @@ class App:
             if action_type == "message" and m.get("message_sent"):
                 skipped_ids.append(str(uid)); continue
             final_ids.append(str(uid))
+        
+        if blacklisted:
+            self._log(f"🚫 {act_label}: Bỏ qua {len(blacklisted)} người trong danh sách đen", "warn")
         
         # Log rõ ràng số bỏ qua
         if skipped_ids:
@@ -1833,6 +1871,163 @@ class App:
         for t in self.templates:
             content_preview = t["content"].replace("\n", " ")[:50] + "..."
             self.tpl_tree.insert("", "end", values=(t.get("name","?"), t["type"], content_preview))
+
+    # ---- Blacklist Manager ----
+    def _load_blacklist(self):
+        try:
+            if BLACKLIST_FILE.exists():
+                return json.loads(BLACKLIST_FILE.read_text("utf-8"))
+        except: pass
+        return []
+
+    def _save_blacklist(self):
+        BLACKLIST_FILE.write_text(json.dumps(self.blacklist, ensure_ascii=False, indent=2), "utf-8")
+
+    def _build_blacklist_tab(self, parent):
+        head = tk.Frame(parent, bg=C["card2"], pady=10)
+        head.pack(fill="x")
+        tk.Label(head, text="🚫 DANH SÁCH ĐEN — Không gửi kết bạn / nhắn tin", font=F["h2"], bg=C["card2"], fg=C["red"]).pack()
+
+        main = tk.Frame(parent, bg=C["bg"], padx=15, pady=15)
+        main.pack(fill="both", expand=True)
+
+        # Left: Blacklist table
+        left = tk.Frame(main, bg=C["bg"])
+        left.pack(side="left", fill="both", expand=True, padx=(0,10))
+
+        info = tk.Frame(left, bg=C["bg"])
+        info.pack(fill="x", pady=(0,5))
+        self.bl_count_lbl = tk.Label(info, text="Tổng: 0 người", font=F["sm"], bg=C["bg"], fg=C["dim"])
+        self.bl_count_lbl.pack(side="left")
+
+        s = ttk.Style()
+        s.configure("BL.Treeview", rowheight=28)
+
+        self.bl_tree = ttk.Treeview(left, columns=("stt", "id", "name", "reason"), show="headings", height=18, style="BL.Treeview")
+        self.bl_tree.heading("stt", text="STT")
+        self.bl_tree.heading("id", text="Zalo ID")
+        self.bl_tree.heading("name", text="Tên / Ghi chú")
+        self.bl_tree.heading("reason", text="Lý do")
+        self.bl_tree.column("stt", width=50, anchor="center")
+        self.bl_tree.column("id", width=200, anchor="w")
+        self.bl_tree.column("name", width=250, anchor="w")
+        self.bl_tree.column("reason", width=200, anchor="w")
+        
+        bl_scroll = ttk.Scrollbar(left, orient="vertical", command=self.bl_tree.yview)
+        self.bl_tree.configure(yscrollcommand=bl_scroll.set)
+        self.bl_tree.pack(side="left", fill="both", expand=True)
+        bl_scroll.pack(side="right", fill="y")
+
+        # Right: Editor
+        right = tk.Frame(main, bg=C["card"], padx=15, pady=15, highlightthickness=1, highlightbackground=C["border"], width=350)
+        right.pack(side="right", fill="y")
+        right.pack_propagate(False)
+
+        tk.Label(right, text="➕ THÊM VÀO DANH SÁCH ĐEN", font=F["h2"], bg=C["card"], fg=C["red"]).pack(pady=(0,10))
+
+        make_label(right, "1. Zalo ID (tùy chọn):").pack(anchor="w")
+        self.bl_id_entry = make_entry(right)
+        self.bl_id_entry.pack(fill="x", pady=(2,8))
+
+        make_label(right, "2. Tên Zalo (tùy chọn — lọc theo tên):").pack(anchor="w")
+        self.bl_name_entry = make_entry(right)
+        self.bl_name_entry.pack(fill="x", pady=(2,8))
+
+        make_label(right, "3. Lý do (ghi chú):").pack(anchor="w")
+        self.bl_reason_entry = make_entry(right)
+        self.bl_reason_entry.pack(fill="x", pady=(2,10))
+
+        Btn(right, "🚫 THÊM VÀO DS ĐEN", cmd=self._bl_add_manual, color=C["red"]).pack(fill="x", pady=5)
+
+        tk.Frame(right, bg=C["border"], height=1).pack(fill="x", pady=10)
+
+        tk.Label(right, text="⚡ THÊM NHANH TỪ BẢNG", font=F["h2"], bg=C["card"], fg=C["orange"]).pack(pady=(0,5))
+        tk.Label(right, text="Bôi đen các dòng ở tab Vận hành,\nrồi bấm nút dưới để chặn hàng loạt.", font=F["sm"], bg=C["card"], fg=C["dim"], justify="left").pack(pady=(0,5))
+        Btn(right, "⚡ Chặn người đang bôi đen", cmd=self._bl_add_from_selection, color=C["orange"]).pack(fill="x", pady=5)
+
+        tk.Frame(right, bg=C["border"], height=1).pack(fill="x", pady=10)
+
+        Btn(right, "🗑️ XÓA KHỎI DS ĐEN (dòng chọn)", cmd=self._bl_remove_selected, color="#374151").pack(fill="x", pady=5)
+        Btn(right, "🗑️ XÓA TOÀN BỘ DS ĐEN", cmd=self._bl_clear_all, color="#374151").pack(fill="x", pady=5)
+
+        tk.Label(right, text="💡 Lọc theo ID hoặc Tên.\nChỉ cần nhập 1 trong 2 là đủ.", font=F["sm"], bg=C["card"], fg=C["dim"], justify="left").pack(pady=10)
+
+        self._bl_refresh_table()
+
+    def _bl_refresh_table(self):
+        self.bl_tree.delete(*self.bl_tree.get_children())
+        for i, b in enumerate(self.blacklist):
+            self.bl_tree.insert("", "end", values=(i+1, b.get("id",""), b.get("name",""), b.get("reason","")))
+        self.bl_count_lbl.config(text=f"Tổng: {len(self.blacklist)} người")
+
+    def _bl_add_manual(self):
+        bl_id = self.bl_id_entry.get().strip()
+        bl_name = self.bl_name_entry.get().strip()
+        bl_reason = self.bl_reason_entry.get().strip()
+
+        if not bl_id and not bl_name:
+            messagebox.showwarning("Thiếu thông tin", "Vui lòng nhập ít nhất Zalo ID hoặc Tên.")
+            return
+
+        # Kiểm tra trùng
+        for b in self.blacklist:
+            if bl_id and str(b.get("id","")) == bl_id:
+                messagebox.showinfo("Đã tồn tại", f"ID {bl_id} đã có trong danh sách đen.")
+                return
+
+        self.blacklist.append({"id": bl_id, "name": bl_name, "reason": bl_reason})
+        self._save_blacklist()
+        self._bl_refresh_table()
+        self._log(f"🚫 Đã thêm vào DS đen: ID={bl_id or '—'} | Tên={bl_name or '—'}", "warn")
+
+        # Clear
+        self.bl_id_entry.delete(0, "end")
+        self.bl_name_entry.delete(0, "end")
+        self.bl_reason_entry.delete(0, "end")
+
+    def _bl_add_from_selection(self):
+        """Thêm hàng loạt từ các dòng đang bôi đen ở tab Vận hành"""
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("Thông báo", "Vui lòng bôi đen các dòng ở tab Vận hành trước!")
+            return
+
+        existing_ids = set(str(b.get("id","")) for b in self.blacklist if b.get("id"))
+        count = 0
+        for item_id in sel:
+            vals = self.tree.item(item_id, "values")
+            uid = str(vals[2])
+            name = str(vals[3])
+            if uid not in existing_ids:
+                self.blacklist.append({"id": uid, "name": name, "reason": "Chặn từ bảng"})
+                existing_ids.add(uid)
+                count += 1
+
+        if count:
+            self._save_blacklist()
+            self._bl_refresh_table()
+            self._log(f"🚫 Đã thêm {count} người vào danh sách đen", "warn")
+        else:
+            messagebox.showinfo("Thông báo", "Tất cả người được chọn đã có trong danh sách đen.")
+
+    def _bl_remove_selected(self):
+        sel = self.bl_tree.selection()
+        if not sel: return
+        indices = sorted([self.bl_tree.index(s) for s in sel], reverse=True)
+        for idx in indices:
+            if 0 <= idx < len(self.blacklist):
+                self.blacklist.pop(idx)
+        self._save_blacklist()
+        self._bl_refresh_table()
+        self._log(f"✅ Đã xóa {len(indices)} người khỏi danh sách đen", "ok")
+
+    def _bl_clear_all(self):
+        if not self.blacklist: return
+        if messagebox.askyesno("Xác nhận", f"Xóa toàn bộ {len(self.blacklist)} người khỏi danh sách đen?"):
+            self.blacklist.clear()
+            self._save_blacklist()
+            self._bl_refresh_table()
+            self._log("✅ Đã xóa toàn bộ danh sách đen", "ok")
 
     def on_close(self):
         if self.bridge: self.bridge.stop()
